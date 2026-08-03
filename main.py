@@ -52,7 +52,7 @@ async def handle_message(update, context):
     user = update.effective_user
     username_mention = f"@{user.username}" if user.username else user.first_name
 
-    # 1. Salva messaggio per il riassunto
+    # 1. Salva messaggio per il riassunto (ultimi 50)
     if chat_id not in chat_history:
         chat_history[chat_id] = []
     
@@ -105,26 +105,33 @@ async def show_leaderboard(update, context):
 
     await update.message.reply_text(text)
 
-# --- COMANDO /RIASSUNTO (TEST LISTA MODELLI) ---
+# --- COMANDO /RIASSUNTO ---
 async def make_summary(update, context):
-    status_msg = await update.message.reply_text("🔍 Recupero la lista dei modelli disponibili dal tuo account...")
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id not in chat_history or len(chat_history[chat_id]) < 3:
+        await update.message.reply_text("🤖 Ci sono troppi pochi messaggi recenti per fare un riassunto! Parlate un altro po'.")
+        return
+
+    status_msg = await update.message.reply_text("🤖 L'IA sta leggendo la chat...")
 
     try:
-        # Interroga Google per capire quali modelli ha attivi il tuo account
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                # Estraiamo solo il nome pulito del modello
-                available_models.append(m.name)
+        conversation_text = "\n".join(chat_history[chat_id])
+        prompt = (
+            "Sei l'assistente ufficiale di un gruppo Telegram. "
+            "Fai un riassunto breve, divertente e ben formattato in italiano degli ultimi messaggi della chat:\n\n"
+            f"{conversation_text}"
+        )
+
+        # Usiamo il modello presente ed efficiente della tua lista
+        model = genai.GenerativeModel('gemini-2.0-flash-lite')
+        response = model.generate_content(prompt)
         
-        if available_models:
-            models_text = "\n".join(available_models)
-            await status_msg.edit_text(f"📋 **MODELLI DISPONIBILI PER TE:**\n\n{models_text}")
-        else:
-            await status_msg.edit_text("❌ Nessun modello compatibile trovato per la tua API key.")
+        summary_text = f"📝 RIASSUNTO DELLA CHAT 🤖\n\n{response.text}"
+        await status_msg.edit_text(summary_text)
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Errore nel recupero modelli: {str(e)}")
+        await status_msg.edit_text(f"❌ Errore riscontrato: {str(e)}")
 
 def main():
     keep_alive()
