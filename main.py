@@ -4,6 +4,15 @@ from datetime import datetime
 from threading import Thread
 from flask import Flask
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
+from google import genai
+
+# --- CONFIGURAZIONE CHIAVI ---
+TELEGRAM_TOKEN = "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I"
+# INCOLLA QUI LA TUA API KEY DI GEMINI:
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Inizializza il client di Gemini
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # --- KEEP ALIVE SERVER ---
 app = Flask('')
@@ -20,81 +29,74 @@ def keep_alive():
     t = Thread(target=run_flask)
     t.start()
 
-# --- GESTIONE DATI PERMANENTI (JSON) ---
+# --- MEMORIA DATI ---
 DATA_FILE = "goat_data.json"
+# Memoria temporanea degli ultimi messaggi del gruppo per il riassunto
+chat_history = {} 
 
 def load_data():
-    """Carica i dati dal file JSON"""
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
     return {"chats": {}}
 
 def save_data(data):
-    """Salva i dati nel file JSON"""
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-# --- LOGICA DEL BOT TELEGRAM ---
+# --- GESTIONE MESSAGGI ---
 async def handle_message(update, context):
     if not update.message or not update.message.text:
         return
 
-    # Controlla se il messaggio è ESATTAMENTE "goat"
-    if update.message.text.strip().lower() == "goat":
-        chat_id = str(update.effective_chat.id)
-        user = update.effective_user
-        
-        # Username o Nome
-        username_mention = f"@{user.username}" if user.username else user.first_name
-        today = str(datetime.now().date())
+    chat_id = str(update.effective_chat.id)
+    text_content = update.message.text.strip()
+    user = update.effective_user
+    username_mention = f"@{user.username}" if user.username else user.first_name
 
+    # 1. SALVA IL MESSAGGIO PER IL RIASSUNTO (Tieni solo gli ultimi 50)
+    if chat_id not in chat_history:
+        chat_history[chat_id] = []
+    
+    # Salva chi ha detto cosa
+    chat_history[chat_id].append(f"{user.first_name}: {text_content}")
+    if len(chat_history[chat_id]) > 50:
+        chat_history[chat_id].pop(0) # Rimuove il messaggio più vecchio
+
+    # 2. LOGICA GOAT
+    if text_content.lower() == "goat":
+        today = str(datetime.now().date())
         data = load_data()
         
-        # Inizializza i dati per questo gruppo se non esistono
         if chat_id not in data["chats"]:
-            data["chats"][chat_id] = {
-                "last_date": None,
-                "today_winner": None,
-                "leaderboard": {}
-            }
+            data["chats"][chat_id] = {"last_date": None, "today_winner": None, "leaderboard": {}}
 
         chat_info = data["chats"][chat_id]
 
-        # Controllo reset giornaliero
         if chat_info["last_date"] != today:
-            # Nuovo vincitore del giorno!
             chat_info["last_date"] = today
             chat_info["today_winner"] = username_mention
             
-            # Aggiorna la classifica (+1 vittoria)
             current_score = chat_info["leaderboard"].get(username_mention, 0)
             chat_info["leaderboard"][username_mention] = current_score + 1
-            
             save_data(data)
             
             total_wins = chat_info["leaderboard"][username_mention]
-            await update.message.reply_text(
-                f"Sei il GOAT del giorno 🐐!\n"
-                f"🏆 Vittorie totali: {total_wins}"
-            )
+            await update.message.reply_text(f"Sei il GOAT del giorno 🐐!\n🏆 Vittorie totali: {total_wins}")
         else:
-            # Titolo già preso oggi
             current_goat = chat_info["today_winner"]
             await update.message.reply_text(f"Già {current_goat} è il Goat del giorno 🐐")
 
+# --- COMANDO /CLASSIFICA ---
 async def show_leaderboard(update, context):
-    """Comando /classifica"""
     chat_id = str(update.effective_chat.id)
     data = load_data()
 
     if chat_id not in data["chats"] or not data["chats"][chat_id]["leaderboard"]:
-        await update.message.reply_text("📊 La classifica è ancora vuota! Scrivete 'goat' per iniziare.")
+        await update.message.reply_text("📊 La classifica è vuota! Scrivete 'goat' per iniziare.")
         return
 
     leaderboard = data["chats"][chat_id]["leaderboard"]
-    
-    # Ordina i giocatori per numero di vittorie (dal più alto al più basso)
     sorted_board = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
 
     text = "🏆 **CLASSIFICA GOAT DEL GRUPPO** 🏆\n\n"
@@ -106,18 +108,50 @@ async def show_leaderboard(update, context):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
+# --- COMANDO /RIASSUNTO (INTEGRAZIONE IA) ---
+async def make_summary(update, context):
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id not in chat_history or len(chat_history[chat_id]) < 3:
+        await update.message.reply_text("🤖 Ci sono troppi pochi messaggi recenti per fare un riassunto! Parlate un altro po'.")
+        return
+
+    # Avvisa la chat che l'IA sta elaborando
+    status_msg = await update.message.reply_text("🤖 L'IA sta leggendo la chat e preparando il riassunto...")
+
+    # Prepara il testo da inviare a Gemini
+    conversation_text = "\n".join(chat_history[chat_id])
+    prompt = (
+        "Sei l'assistente ufficiale di un gruppo Telegram. "
+        "Ecco gli ultimi messaggi inviati nella chat:\n\n"
+        f"{conversation_text}\n\n"
+        "Fai un riassunto breve, divertente e ben formattato in italiano degli argomenti principali trattati. "
+        "Usa punti elenco ed emoji. Evidenzia chi ha detto le cose più importanti."
+    )
+
+    try:
+        # Chiamata all'API di Gemini
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        
+        summary_text = f"📝 **RIASSUNTO DELLA CHAT** 🤖\n\n{response.text}"
+        await status_msg.edit_text(summary_text, parse_mode="Markdown")
+
+    except Exception as e:
+        print(f"Errore Gemini: {e}")
+        await status_msg.edit_text("❌ Si è verificato un errore durante la generazione del riassunto.")
+
 def main():
     keep_alive()
 
-    token = "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I"
-
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Gestore per il messaggio "goat"
+    # Handlers
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Gestore per il comando /classifica
     application.add_handler(CommandHandler("classifica", show_leaderboard))
+    application.add_handler(CommandHandler("riassunto", make_summary))
     
     print("Bot avviato...")
     application.run_polling()
