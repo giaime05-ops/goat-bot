@@ -8,7 +8,7 @@ from google import genai
 
 # --- CONFIGURAZIONE CHIAVI ---
 TELEGRAM_TOKEN = "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I"
-# INCOLLA QUI LA TUA API KEY DI GEMINI:
+# Prende la chiave in modo sicuro da Render (Environment Variables):
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Inizializza il client di Gemini
@@ -44,7 +44,7 @@ def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-# --- GESTIONE MESSAGGI ---
+# --- GESTIONE MESSAGGI (GOAT + MEMORIA IA) ---
 async def handle_message(update, context):
     if not update.message or not update.message.text:
         return
@@ -58,10 +58,9 @@ async def handle_message(update, context):
     if chat_id not in chat_history:
         chat_history[chat_id] = []
     
-    # Salva chi ha detto cosa
     chat_history[chat_id].append(f"{user.first_name}: {text_content}")
     if len(chat_history[chat_id]) > 50:
-        chat_history[chat_id].pop(0) # Rimuove il messaggio più vecchio
+        chat_history[chat_id].pop(0)
 
     # 2. LOGICA GOAT
     if text_content.lower() == "goat":
@@ -108,7 +107,7 @@ async def show_leaderboard(update, context):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# --- COMANDO /RIASSUNTO (INTEGRAZIONE IA) ---
+# --- COMANDO /RIASSUNTO (CON DEBUG ERRORE) ---
 async def make_summary(update, context):
     chat_id = str(update.effective_chat.id)
     
@@ -116,21 +115,16 @@ async def make_summary(update, context):
         await update.message.reply_text("🤖 Ci sono troppi pochi messaggi recenti per fare un riassunto! Parlate un altro po'.")
         return
 
-    # Avvisa la chat che l'IA sta elaborando
-    status_msg = await update.message.reply_text("🤖 L'IA sta leggendo la chat e preparando il riassunto...")
-
-    # Prepara il testo da inviare a Gemini
-    conversation_text = "\n".join(chat_history[chat_id])
-    prompt = (
-        "Sei l'assistente ufficiale di un gruppo Telegram. "
-        "Ecco gli ultimi messaggi inviati nella chat:\n\n"
-        f"{conversation_text}\n\n"
-        "Fai un riassunto breve, divertente e ben formattato in italiano degli argomenti principali trattati. "
-        "Usa punti elenco ed emoji. Evidenzia chi ha detto le cose più importanti."
-    )
+    status_msg = await update.message.reply_text("🤖 L'IA sta leggendo la chat...")
 
     try:
-        # Chiamata all'API di Gemini
+        conversation_text = "\n".join(chat_history[chat_id])
+        prompt = (
+            "Sei l'assistente del gruppo Telegram. Fai un riassunto breve e divertente in italiano degli ultimi messaggi della chat:\n\n"
+            f"{conversation_text}"
+        )
+
+        # Modello standard Gemini
         response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
@@ -140,15 +134,15 @@ async def make_summary(update, context):
         await status_msg.edit_text(summary_text, parse_mode="Markdown")
 
     except Exception as e:
-        print(f"Errore Gemini: {e}")
-        await status_msg.edit_text("❌ Si è verificato un errore durante la generazione del riassunto.")
+        print(f"ERRORE GEMINI: {e}")
+        # Se c'è un errore, il bot ti scriverà in chat l'errore esatto!
+        await status_msg.edit_text(f"❌ Errore IA: {str(e)[:150]}")
 
 def main():
     keep_alive()
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Handlers
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CommandHandler("classifica", show_leaderboard))
     application.add_handler(CommandHandler("riassunto", make_summary))
