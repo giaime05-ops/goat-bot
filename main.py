@@ -4,15 +4,15 @@ from datetime import datetime
 from threading import Thread
 from flask import Flask
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
-from google import genai
+import google.generativeai as genai
 
 # --- CONFIGURAZIONE CHIAVI ---
 TELEGRAM_TOKEN = "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I"
-# Prende la chiave in modo sicuro dalle variabili d'ambiente di Render:
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Inizializza il client di Gemini
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# Inizializzazione classica Gemini
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # --- KEEP ALIVE SERVER ---
 app = Flask('')
@@ -31,7 +31,6 @@ def keep_alive():
 
 # --- MEMORIA DATI ---
 DATA_FILE = "goat_data.json"
-# Memoria temporanea degli ultimi messaggi del gruppo per il riassunto
 chat_history = {} 
 
 def load_data():
@@ -54,16 +53,15 @@ async def handle_message(update, context):
     user = update.effective_user
     username_mention = f"@{user.username}" if user.username else user.first_name
 
-    # 1. SALVA IL MESSAGGIO PER IL RIASSUNTO (Tieni solo gli ultimi 50)
+    # 1. Salva messaggio per riassunto
     if chat_id not in chat_history:
         chat_history[chat_id] = []
     
-    # Salva chi ha detto cosa
     chat_history[chat_id].append(f"{user.first_name}: {text_content}")
     if len(chat_history[chat_id]) > 50:
-        chat_history[chat_id].pop(0) # Rimuove il messaggio più vecchio
+        chat_history[chat_id].pop(0)
 
-    # 2. LOGICA GOAT
+    # 2. Logica GOAT
     if text_content.lower() == "goat":
         today = str(datetime.now().date())
         data = load_data()
@@ -126,11 +124,8 @@ async def make_summary(update, context):
             f"{conversation_text}"
         )
 
-        # Usiamo il nome formale con prefisso 'models/' accettato dall'SDK
-        response = ai_client.models.generate_content(
-            model='models/gemini-1.5-flash',
-            contents=prompt,
-        )
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(prompt)
         
         summary_text = f"📝 RIASSUNTO DELLA CHAT 🤖\n\n{response.text}"
         await status_msg.edit_text(summary_text)
@@ -143,7 +138,6 @@ def main():
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Handlers
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CommandHandler("classifica", show_leaderboard))
     application.add_handler(CommandHandler("riassunto", make_summary))
