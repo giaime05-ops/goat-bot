@@ -10,7 +10,7 @@ import google.generativeai as genai
 TELEGRAM_TOKEN = "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Inizializzazione classica Gemini
+# Inizializzazione della libreria classica di Gemini
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -53,7 +53,7 @@ async def handle_message(update, context):
     user = update.effective_user
     username_mention = f"@{user.username}" if user.username else user.first_name
 
-    # 1. Salva messaggio per riassunto
+    # 1. Salva messaggio per il riassunto (ultimi 50)
     if chat_id not in chat_history:
         chat_history[chat_id] = []
     
@@ -61,7 +61,7 @@ async def handle_message(update, context):
     if len(chat_history[chat_id]) > 50:
         chat_history[chat_id].pop(0)
 
-    # 2. Logica GOAT
+    # 2. Logica Gioco GOAT
     if text_content.lower() == "goat":
         today = str(datetime.now().date())
         data = load_data()
