@@ -2,3 +2,4 @@ python-telegram-bot
 flask
 gunicorn
 pytz
+google-genai
