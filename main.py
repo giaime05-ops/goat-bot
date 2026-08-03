@@ -108,7 +108,7 @@ async def show_leaderboard(update, context):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# --- COMANDO /RIASSUNTO (INTEGRAZIONE IA) ---
+# --- COMANDO /RIASSUNTO (CON GEMINI 2.0 FLASH + DIAGNOSTICA IN CHAT) ---
 async def make_summary(update, context):
     chat_id = str(update.effective_chat.id)
     
@@ -116,23 +116,18 @@ async def make_summary(update, context):
         await update.message.reply_text("🤖 Ci sono troppi pochi messaggi recenti per fare un riassunto! Parlate un altro po'.")
         return
 
-    # Avvisa la chat che l'IA sta elaborando
-    status_msg = await update.message.reply_text("🤖 L'IA sta leggendo la chat e preparando il riassunto...")
-
-    # Prepara il testo da inviare a Gemini
-    conversation_text = "\n".join(chat_history[chat_id])
-    prompt = (
-        "Sei l'assistente ufficiale di un gruppo Telegram. "
-        "Ecco gli ultimi messaggi inviati nella chat:\n\n"
-        f"{conversation_text}\n\n"
-        "Fai un riassunto breve, divertente e ben formattato in italiano degli argomenti principali trattati. "
-        "Usa punti elenco ed emoji. Evidenzia chi ha detto le cose più importanti."
-    )
+    status_msg = await update.message.reply_text("🤖 L'IA sta leggendo la chat...")
 
     try:
-        # Chiamata all'API di Gemini con il modello corretto
+        conversation_text = "\n".join(chat_history[chat_id])
+        prompt = (
+            "Sei l'assistente ufficiale di un gruppo Telegram. "
+            "Fai un riassunto breve, divertente e ben formattato in italiano degli ultimi messaggi della chat:\n\n"
+            f"{conversation_text}"
+        )
+
         response = ai_client.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
         )
         
@@ -140,8 +135,8 @@ async def make_summary(update, context):
         await status_msg.edit_text(summary_text, parse_mode="Markdown")
 
     except Exception as e:
-        print(f"Errore Gemini: {e}")
-        await status_msg.edit_text("❌ Si è verificato un errore durante la generazione del riassunto.")
+        # Se c'è un errore, il bot lo scrive direttamente in chat così sappiamo qual è!
+        await status_msg.edit_text(f"❌ Errore riscontrato: {str(e)}")
 
 def main():
     keep_alive()
