@@ -99,16 +99,16 @@ async def show_leaderboard(update, context):
     leaderboard = data["chats"][chat_id]["leaderboard"]
     sorted_board = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
 
-    text = "🏆 **CLASSIFICA GOAT DEL GRUPPO** 🏆\n\n"
+    text = "🏆 CLASSIFICA GOAT DEL GRUPPO 🏆\n\n"
     medals = ["🥇", "🥈", "🥉"]
 
     for index, (user, wins) in enumerate(sorted_board):
         icon = medals[index] if index < 3 else "👤"
-        text += f"{icon} {user}: **{wins}** {'vittoria' if wins == 1 else 'vittorie'}\n"
+        text += f"{icon} {user}: {wins} {'vittoria' if wins == 1 else 'vittorie'}\n"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
-# --- COMANDO /RIASSUNTO (CON GEMINI 2.0 FLASH + DIAGNOSTICA IN CHAT) ---
+# --- COMANDO /RIASSUNTO ---
 async def make_summary(update, context):
     chat_id = str(update.effective_chat.id)
     
@@ -126,16 +126,16 @@ async def make_summary(update, context):
             f"{conversation_text}"
         )
 
+        # Usiamo il nome formale con prefisso 'models/' accettato dall'SDK
         response = ai_client.models.generate_content(
-            model='gemini-1.5-flash-latest',
+            model='models/gemini-1.5-flash',
             contents=prompt,
         )
         
-        summary_text = f"📝 **RIASSUNTO DELLA CHAT** 🤖\n\n{response.text}"
-        await status_msg.edit_text(summary_text, parse_mode="Markdown")
+        summary_text = f"📝 RIASSUNTO DELLA CHAT 🤖\n\n{response.text}"
+        await status_msg.edit_text(summary_text)
 
     except Exception as e:
-        # Se c'è un errore, il bot lo scrive direttamente in chat così sappiamo qual è!
         await status_msg.edit_text(f"❌ Errore riscontrato: {str(e)}")
 
 def main():
