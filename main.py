@@ -20,7 +20,6 @@ def keep_alive():
     t.start()
 
 # --- LOGICA DEL BOT TELEGRAM ---
-# Dizionario in memoria per salvare lo stato per ogni gruppo
 goat_data = {}
 
 async def handle_message(update, context):
@@ -52,11 +51,8 @@ def main():
     # Avvia il server Flask in background per il keep-alive
     keep_alive()
 
-    # Prende il token dalle variabili d'ambiente di Render
-    token = os.environ.get("TELEGRAM_TOKEN")
-    if not token:
-        print("ERRORE: TELEGRAM_TOKEN non trovato!")
-        return
+    # Token di BotFather
+    token = "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I"
 
     # Avvia il bot Telegram
     application = Application.builder().token(token).build()
