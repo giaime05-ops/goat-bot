@@ -124,7 +124,7 @@ async def make_summary(update, context):
         )
 
         # Usiamo il modello presente ed efficiente della tua lista
-        model = genai.GenerativeModel('gemini-2.0-flash-lite')
+        model = genai.GenerativeModel('gemini-3.5-flash')
         response = model.generate_content(prompt)
         
         summary_text = f"📝 RIASSUNTO DELLA CHAT 🤖\n\n{response.text}"
