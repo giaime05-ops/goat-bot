@@ -1,13 +1,14 @@
 import os
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from threading import Thread
 from flask import Flask
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 import google.generativeai as genai
 
 # --- CONFIGURAZIONE CHIAVI ---
-TELEGRAM_TOKEN = "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if GEMINI_API_KEY:
@@ -34,13 +35,20 @@ chat_history = {}
 
 def load_data():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {"chats": {}}
     return {"chats": {}}
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
+
+def get_italian_date():
+    """Restituisce la data odierna esatta in Italia (Europe/Rome)"""
+    return str(datetime.now(ZoneInfo("Europe/Rome")).date())
 
 # --- GESTIONE MESSAGGI ---
 async def handle_message(update, context):
@@ -52,21 +60,24 @@ async def handle_message(update, context):
     user = update.effective_user
     username_mention = f"@{user.username}" if user.username else user.first_name
 
-    # 1. Salva messaggio per il riassunto (ultimi 75)
+    # 1. Salva messaggio per il riassunto (mantiene fino a 500 messaggi)
     if chat_id not in chat_history:
         chat_history[chat_id] = []
     
     chat_history[chat_id].append(f"{user.first_name}: {text_content}")
     
-    # Limite aggiornato a 75 messaggi
-    if len(chat_history[chat_id]) > 75:
+    # Limite massimo portato a 500 messaggi
+    if len(chat_history[chat_id]) > 500:
         chat_history[chat_id].pop(0)
 
     # 2. Logica GOAT
     if text_content.lower() == "goat":
-        today = str(datetime.now().date())
+        today = get_italian_date()
         data = load_data()
         
+        if "chats" not in data:
+            data["chats"] = {}
+
         if chat_id not in data["chats"]:
             data["chats"][chat_id] = {"last_date": None, "today_winner": None, "leaderboard": {}}
 
@@ -92,12 +103,12 @@ async def handle_message(update, context):
                 parse_mode='HTML'
             )
 
-# --- COMANDO /GOATBOARD (Ex /classifica) ---
+# --- COMANDO /GOATBOARD ---
 async def show_goatboard(update, context):
     chat_id = str(update.effective_chat.id)
     data = load_data()
 
-    if chat_id not in data["chats"] or not data["chats"][chat_id]["leaderboard"]:
+    if "chats" not in data or chat_id not in data["chats"] or not data["chats"][chat_id]["leaderboard"]:
         await update.message.reply_text(
             "📊 La classifica è vuota! Scrivete 'goat' per iniziare.",
             parse_mode='HTML'
@@ -117,21 +128,32 @@ async def show_goatboard(update, context):
 
     await update.message.reply_text(text, parse_mode='HTML')
 
-# --- COMANDO /RIASSUNTO ---
+# --- COMANDO /RIASSUNTO (Ultimi 75 messaggi) ---
 async def make_summary(update, context):
+    await generate_summary_response(update, limit=75, title="RIASSUNTO BREVE")
+
+# --- COMANDO /RIASSUNTOLUNGO (Ultimi 500 messaggi) ---
+async def make_long_summary(update, context):
+    await generate_summary_response(update, limit=500, title="RIASSUNTO ESTESO")
+
+# --- FUNZIONE GENERICA RIASSUNTI ---
+async def generate_summary_response(update, limit, title):
     chat_id = str(update.effective_chat.id)
     
     if chat_id not in chat_history or len(chat_history[chat_id]) < 3:
         await update.message.reply_text("🤖 Ci sono troppi pochi messaggi recenti per fare un riassunto! Parlate un altro po'.")
         return
 
-    status_msg = await update.message.reply_text("🤖 L'IA sta leggendo la chat...")
+    status_msg = await update.message.reply_text(f"🤖 L'IA sta leggendo gli ultimi messaggi per il {title.lower()}...")
 
     try:
-        conversation_text = "\n".join(chat_history[chat_id])
+        # Prende solo gli ultimi N messaggi in base al limite
+        recent_messages = chat_history[chat_id][-limit:]
+        conversation_text = "\n".join(recent_messages)
+        
         prompt = (
-            "Sei l'assistente ufficiale di un gruppo Telegram. "
-            "Fai un riassunto breve, divertente e ben formattato in italiano degli ultimi messaggi della chat.\n\n"
+            f"Sei l'assistente ufficiale di un gruppo Telegram. "
+            f"Fai un {title.lower()} divertente e ben organizzato in italiano di questa conversazione.\n\n"
             "REGOLE TASSATIVE DI FORMATTAZIONE:\n"
             "- NON usare MAI la sintassi Markdown (niente asterischi **, cancelletti #, trattini bassi _).\n"
             "- Usa ESCLUSIVAMENTE i tag HTML <b> e </b> per mettere in grassetto concetti o nomi importanti.\n"
@@ -142,7 +164,7 @@ async def make_summary(update, context):
         model = genai.GenerativeModel('gemini-3.1-flash-lite')
         response = model.generate_content(prompt)
         
-        summary_text = f"📝 <b>RIASSUNTO DELLA CHAT</b> 🤖\n\n{response.text}"
+        summary_text = f"📝 <b>{title} DELLA CHAT</b> 🤖\n\n{response.text}"
         await status_msg.edit_text(summary_text, parse_mode='HTML')
 
     except Exception as e:
@@ -153,9 +175,13 @@ def main():
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Registrazione comandi
     application.add_handler(CommandHandler("goatboard", show_goatboard))
     application.add_handler(CommandHandler("riassunto", make_summary))
+    application.add_handler(CommandHandler("riassuntolungo", make_long_summary))
+    
+    # Handlers per messaggi di testo generici
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("Bot avviato...")
     application.run_polling()
