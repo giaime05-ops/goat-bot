@@ -139,7 +139,7 @@ async def make_summary(update, context):
             f"Ecco i messaggi:\n{conversation_text}"
         )
 
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-3.1-flash-lite')
         response = model.generate_content(prompt)
         
         summary_text = f"📝 <b>RIASSUNTO DELLA CHAT</b> 🤖\n\n{response.text}"
