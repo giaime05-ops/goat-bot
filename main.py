@@ -52,12 +52,14 @@ async def handle_message(update, context):
     user = update.effective_user
     username_mention = f"@{user.username}" if user.username else user.first_name
 
-    # 1. Salva messaggio per il riassunto (ultimi 50)
+    # 1. Salva messaggio per il riassunto (ultimi 75)
     if chat_id not in chat_history:
         chat_history[chat_id] = []
     
     chat_history[chat_id].append(f"{user.first_name}: {text_content}")
-    if len(chat_history[chat_id]) > 50:
+    
+    # Limite aggiornato a 75 messaggi
+    if len(chat_history[chat_id]) > 75:
         chat_history[chat_id].pop(0)
 
     # 2. Logica GOAT
@@ -79,31 +81,41 @@ async def handle_message(update, context):
             save_data(data)
             
             total_wins = chat_info["leaderboard"][username_mention]
-            await update.message.reply_text(f"Sei il GOAT del giorno 🐐!\n🏆 Vittorie totali: {total_wins}")
+            await update.message.reply_text(
+                f"Sei il GOAT del giorno 🐐!\n🏆 Vittorie totali: <b>{total_wins}</b>",
+                parse_mode='HTML'
+            )
         else:
             current_goat = chat_info["today_winner"]
-            await update.message.reply_text(f"Già {current_goat} è il Goat del giorno 🐐")
+            await update.message.reply_text(
+                f"Già <b>{current_goat}</b> è il Goat del giorno 🐐",
+                parse_mode='HTML'
+            )
 
-# --- COMANDO /CLASSIFICA ---
-async def show_leaderboard(update, context):
+# --- COMANDO /GOATBOARD (Ex /classifica) ---
+async def show_goatboard(update, context):
     chat_id = str(update.effective_chat.id)
     data = load_data()
 
     if chat_id not in data["chats"] or not data["chats"][chat_id]["leaderboard"]:
-        await update.message.reply_text("📊 La classifica è vuota! Scrivete 'goat' per iniziare.")
+        await update.message.reply_text(
+            "📊 La classifica è vuota! Scrivete 'goat' per iniziare.",
+            parse_mode='HTML'
+        )
         return
 
     leaderboard = data["chats"][chat_id]["leaderboard"]
     sorted_board = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
 
-    text = "🏆 CLASSIFICA GOAT DEL GRUPPO 🏆\n\n"
+    text = "🏆 <b>CLASSIFICA GOAT DEL GRUPPO</b> 🏆\n\n"
     medals = ["🥇", "🥈", "🥉"]
 
     for index, (user, wins) in enumerate(sorted_board):
         icon = medals[index] if index < 3 else "👤"
-        text += f"{icon} {user}: {wins} {'vittoria' if wins == 1 else 'vittorie'}\n"
+        unit = "vittoria" if wins == 1 else "vittorie"
+        text += f"{icon} <b>{user}</b>: {wins} {unit}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode='HTML')
 
 # --- COMANDO /RIASSUNTO ---
 async def make_summary(update, context):
@@ -119,16 +131,19 @@ async def make_summary(update, context):
         conversation_text = "\n".join(chat_history[chat_id])
         prompt = (
             "Sei l'assistente ufficiale di un gruppo Telegram. "
-            "Fai un riassunto breve, divertente e ben formattato in italiano degli ultimi messaggi della chat:\n\n"
-            f"{conversation_text}"
+            "Fai un riassunto breve, divertente e ben formattato in italiano degli ultimi messaggi della chat.\n\n"
+            "REGOLE TASSATIVE DI FORMATTAZIONE:\n"
+            "- NON usare MAI la sintassi Markdown (niente asterischi **, cancelletti #, trattini bassi _).\n"
+            "- Usa ESCLUSIVAMENTE i tag HTML <b> e </b> per mettere in grassetto concetti o nomi importanti.\n"
+            "- Usa le emoji per organizzare il testo in modo elegante.\n\n"
+            f"Ecco i messaggi:\n{conversation_text}"
         )
 
-        # Usiamo il modello presente ed efficiente della tua lista
         model = genai.GenerativeModel('gemini-3.5-flash')
         response = model.generate_content(prompt)
         
-        summary_text = f"📝 RIASSUNTO DELLA CHAT 🤖\n\n{response.text}"
-        await status_msg.edit_text(summary_text)
+        summary_text = f"📝 <b>RIASSUNTO DELLA CHAT</b> 🤖\n\n{response.text}"
+        await status_msg.edit_text(summary_text, parse_mode='HTML')
 
     except Exception as e:
         await status_msg.edit_text(f"❌ Errore riscontrato: {str(e)}")
@@ -139,7 +154,7 @@ def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CommandHandler("classifica", show_leaderboard))
+    application.add_handler(CommandHandler("goatboard", show_goatboard))
     application.add_handler(CommandHandler("riassunto", make_summary))
     
     print("Bot avviato...")
