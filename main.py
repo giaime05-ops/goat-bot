@@ -280,10 +280,15 @@ async def generate_summary_response(update, limit, title):
     except Exception as e:
         await status_msg.edit_text(f"❌ Errore riscontrato: {str(e)}")
 
+# --- INIZIALIZZAZIONE ASINCRONA TASK ---
+async def post_init(application: Application):
+    """Avvia i task in background dopo l'inizializzazione corretta del loop"""
+    asyncio.create_task(weekly_auto_reset_task(application))
+
 def main():
     keep_alive()
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     
     # Registrazione Comandi
     application.add_handler(CommandHandler("goatboard", show_goatboard))
@@ -294,10 +299,6 @@ def main():
     
     # Message Handlers
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-    
-    # Task settimanale in background
-    loop = asyncio.get_event_loop()
-    loop.create_task(weekly_auto_reset_task(application))
 
     print("GOAT Bot attivo!", flush=True)
     application.run_polling()
