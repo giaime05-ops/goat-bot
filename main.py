@@ -1,5 +1,7 @@
 import os
 import json
+import asyncio
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from threading import Thread
@@ -7,14 +9,18 @@ from flask import Flask
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 import google.generativeai as genai
 
-# --- CONFIGURAZIONE CHIAVI ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# --- LOGGING ---
+logging.basicConfig(level=logging.INFO)
+
+# --- VARIABILI D'AMBIENTE ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID")  # Es. "-100xxxxxxxxxx"
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# --- KEEP ALIVE SERVER ---
+# --- KEEP ALIVE SERVER (Flask) ---
 app = Flask('')
 
 @app.route('/')
@@ -26,62 +32,108 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run_flask)
+    t = Thread(target=run_flask, daemon=True)
     t.start()
 
-# --- MEMORIA DATI ---
+# --- MEMORIA E BACKUP DATI ---
 DATA_FILE = "goat_data.json"
 chat_history = {} 
 
-def load_data():
+def get_italian_now():
+    """Restituisce il datetime corrente con fuso orario italiano"""
+    return datetime.now(ZoneInfo("Europe/Rome"))
+
+def get_italian_date():
+    """Restituisce la data odierna esatta in Italia (YYYY-MM-DD)"""
+    return str(get_italian_now().date())
+
+def load_local_data():
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r") as f:
                 return json.load(f)
-        except Exception:
-            return {"chats": {}}
+        except Exception as e:
+            logging.error(f"Errore lettura file locale: {e}")
     return {"chats": {}}
 
-def save_data(data):
+def save_local_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-def get_italian_date():
-    """Restituisce la data odierna esatta in Italia (Europe/Rome)"""
-    return str(datetime.now(ZoneInfo("Europe/Rome")).date())
+async def backup_to_telegram(context):
+    """Invia il file JSON corrente al canale di backup"""
+    if not BACKUP_CHAT_ID:
+        return
+    try:
+        data = load_local_data()
+        save_local_data(data)
+        with open(DATA_FILE, "rb") as f:
+            await context.bot.send_document(
+                chat_id=BACKUP_CHAT_ID,
+                document=f,
+                caption=f"📦 Backup Automatico - {get_italian_now().strftime('%d/%m/%Y %H:%M:%S')}"
+            )
+    except Exception as e:
+        logging.error(f"Errore durante il backup su Telegram: {e}")
+
+# --- INIT E STRUTTURA CHAT ---
+def init_chat_structure(data, chat_id):
+    if "chats" not in data:
+        data["chats"] = {}
+    if chat_id not in data["chats"]:
+        data["chats"][chat_id] = {
+            "last_date": None,
+            "today_winner": None,
+            "leaderboard": {},
+            "msg_weekly": {},
+            "msg_ever": {}
+        }
+    else:
+        chat_info = data["chats"][chat_id]
+        if "msg_weekly" not in chat_info:
+            chat_info["msg_weekly"] = {}
+        if "msg_ever" not in chat_info:
+            chat_info["msg_ever"] = {}
 
 # --- GESTIONE MESSAGGI ---
 async def handle_message(update, context):
-    if not update.message or not update.message.text:
+    if not update.message or not update.message.from_user:
         return
 
+    user = update.message.from_user
     chat_id = str(update.effective_chat.id)
-    text_content = update.message.text.strip()
-    user = update.effective_user
+
+    # UTILS: Stampa nei Log di Render l'ID della chat (utile per recuperare l'ID del gruppo di backup)
+    print(f"--- ID CHAT RILEVATO: {chat_id} ---", flush=True)
+
+    # IGNORA TUTTI I BOT DAL CONTEGGIO MESSAGGI
+    if user.is_bot:
+        return
+
+    text_content = (update.message.text or update.message.caption or "").strip()
     username_mention = f"@{user.username}" if user.username else user.first_name
 
-    # 1. Salva messaggio per il riassunto (mantiene fino a 500 messaggi)
-    if chat_id not in chat_history:
-        chat_history[chat_id] = []
-    
-    chat_history[chat_id].append(f"{user.first_name}: {text_content}")
-    
-    # Limite massimo portato a 500 messaggi
-    if len(chat_history[chat_id]) > 500:
-        chat_history[chat_id].pop(0)
+    # 1. Salva messaggio per il riassunto (fino a 500)
+    if text_content:
+        if chat_id not in chat_history:
+            chat_history[chat_id] = []
+        chat_history[chat_id].append(f"{user.first_name}: {text_content}")
+        if len(chat_history[chat_id]) > 500:
+            chat_history[chat_id].pop(0)
 
-    # 2. Logica GOAT
+    # 2. Registra conteggio messaggi (Settimanale & Ever)
+    data = load_local_data()
+    init_chat_structure(data, chat_id)
+    
+    chat_info = data["chats"][chat_id]
+    chat_info["msg_weekly"][username_mention] = chat_info["msg_weekly"].get(username_mention, 0) + 1
+    chat_info["msg_ever"][username_mention] = chat_info["msg_ever"].get(username_mention, 0) + 1
+    
+    save_local_data(data)
+
+    # 3. Logica GOAT
     if text_content.lower() == "goat":
         today = get_italian_date()
-        data = load_data()
-        
-        if "chats" not in data:
-            data["chats"] = {}
-
-        if chat_id not in data["chats"]:
-            data["chats"][chat_id] = {"last_date": None, "today_winner": None, "leaderboard": {}}
-
-        chat_info = data["chats"][chat_id]
 
         if chat_info["last_date"] != today:
             chat_info["last_date"] = today
@@ -89,8 +141,11 @@ async def handle_message(update, context):
             
             current_score = chat_info["leaderboard"].get(username_mention, 0)
             chat_info["leaderboard"][username_mention] = current_score + 1
-            save_data(data)
+            save_local_data(data)
             
+            # Esegue il backup su Telegram
+            await backup_to_telegram(context)
+
             total_wins = chat_info["leaderboard"][username_mention]
             await update.message.reply_text(
                 f"Sei il GOAT del giorno 🐐!\n🏆 Vittorie totali: <b>{total_wins}</b>",
@@ -103,21 +158,49 @@ async def handle_message(update, context):
                 parse_mode='HTML'
             )
 
-# --- COMANDO /GOATBOARD ---
+# --- CLASSIFICHE MESSAGGI ---
+def generate_ranking_text(title, ranking_dict):
+    if not ranking_dict:
+        return f"{title}\n\n<i>Nessun messaggio registrato per ora.</i>"
+    
+    sorted_board = sorted(ranking_dict.items(), key=lambda x: x[1], reverse=True)
+    text = f"{title}\n\n"
+    medals = ["🥇", "🥈", "🥉"]
+
+    for index, (user, count) in enumerate(sorted_board):
+        icon = medals[index] if index < 3 else "💬"
+        unit = "messaggio" if count == 1 else "messaggi"
+        text += f"{icon} <b>{user}</b>: {count} {unit}\n"
+    
+    return text
+
+async def show_weekly_ranking(update, context):
+    chat_id = str(update.effective_chat.id)
+    data = load_local_data()
+    init_chat_structure(data, chat_id)
+    
+    text = generate_ranking_text("📊 <b>CLASSIFICA SETTIMANALE MESSAGGI</b> 📊", data["chats"][chat_id]["msg_weekly"])
+    await update.message.reply_text(text, parse_mode='HTML')
+
+async def show_ever_ranking(update, context):
+    chat_id = str(update.effective_chat.id)
+    data = load_local_data()
+    init_chat_structure(data, chat_id)
+    
+    text = generate_ranking_text("👑 <b>CLASSIFICA GENERALE MESSAGGI (EVER)</b> 👑", data["chats"][chat_id]["msg_ever"])
+    await update.message.reply_text(text, parse_mode='HTML')
+
 async def show_goatboard(update, context):
     chat_id = str(update.effective_chat.id)
-    data = load_data()
-
-    if "chats" not in data or chat_id not in data["chats"] or not data["chats"][chat_id]["leaderboard"]:
-        await update.message.reply_text(
-            "📊 La classifica è vuota! Scrivete 'goat' per iniziare.",
-            parse_mode='HTML'
-        )
-        return
+    data = load_local_data()
+    init_chat_structure(data, chat_id)
 
     leaderboard = data["chats"][chat_id]["leaderboard"]
-    sorted_board = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
+    if not leaderboard:
+        await update.message.reply_text("📊 La classifica GOAT è vuota! Scrivete 'goat' per iniziare.", parse_mode='HTML')
+        return
 
+    sorted_board = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
     text = "🏆 <b>CLASSIFICA GOAT DEL GRUPPO</b> 🏆\n\n"
     medals = ["🥇", "🥈", "🥉"]
 
@@ -128,26 +211,53 @@ async def show_goatboard(update, context):
 
     await update.message.reply_text(text, parse_mode='HTML')
 
-# --- COMANDO /RIASSUNTO (Ultimi 75 messaggi) ---
+# --- AUTONOMOUS TASK: RESET E PUBBLICAZIONE DOMENICA ALLE 15:00 ---
+async def weekly_auto_reset_task(app):
+    while True:
+        now = get_italian_now()
+        # Controlla se è Domenica (weekday 6) e sono le 15:00
+        if now.weekday() == 6 and now.hour == 15 and now.minute == 0:
+            data = load_local_data()
+            if "chats" in data:
+                for chat_id, chat_info in data["chats"].items():
+                    try:
+                        text = generate_ranking_text(
+                            "🏆 <b>CLASSIFICA FINALE DELLA SETTIMANA</b> 🏆\n"
+                            "<i>I contatori della settimana sono stati appena azzerati!</i>",
+                            chat_info.get("msg_weekly", {})
+                        )
+                        await app.bot.send_message(chat_id=int(chat_id), text=text, parse_mode='HTML')
+                        
+                        # Resetta la classifica settimanale
+                        chat_info["msg_weekly"] = {}
+                    except Exception as e:
+                        logging.error(f"Errore invio classifica automatica alla chat {chat_id}: {e}")
+                
+                save_local_data(data)
+                class MockContext:
+                    bot = app.bot
+                await backup_to_telegram(MockContext())
+
+            await asyncio.sleep(61)
+        else:
+            await asyncio.sleep(30)
+
+# --- COMANDI RIASSUNTO GEMINI ---
 async def make_summary(update, context):
     await generate_summary_response(update, limit=75, title="RIASSUNTO BREVE")
 
-# --- COMANDO /RIASSUNTOLUNGO (Ultimi 500 messaggi) ---
 async def make_long_summary(update, context):
     await generate_summary_response(update, limit=500, title="RIASSUNTO ESTESO")
 
-# --- FUNZIONE GENERICA RIASSUNTI ---
 async def generate_summary_response(update, limit, title):
     chat_id = str(update.effective_chat.id)
-    
     if chat_id not in chat_history or len(chat_history[chat_id]) < 3:
-        await update.message.reply_text("🤖 Ci sono troppi pochi messaggi recenti per fare un riassunto! Parlate un altro po'.")
+        await update.message.reply_text("🤖 Ci sono troppi pochi messaggi recenti per fare un riassunto!")
         return
 
     status_msg = await update.message.reply_text(f"🤖 L'IA sta leggendo gli ultimi messaggi per il {title.lower()}...")
 
     try:
-        # Prende solo gli ultimi N messaggi in base al limite
         recent_messages = chat_history[chat_id][-limit:]
         conversation_text = "\n".join(recent_messages)
         
@@ -175,15 +285,21 @@ def main():
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Registrazione comandi
+    # Registrazione Comandi
     application.add_handler(CommandHandler("goatboard", show_goatboard))
+    application.add_handler(CommandHandler("classificasettimana", show_weekly_ranking))
+    application.add_handler(CommandHandler("classificaever", show_ever_ranking))
     application.add_handler(CommandHandler("riassunto", make_summary))
     application.add_handler(CommandHandler("riassuntolungo", make_long_summary))
     
-    # Handlers per messaggi di testo generici
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Message Handlers
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     
-    print("Bot avviato...")
+    # Task settimanale in background
+    loop = asyncio.get_event_loop()
+    loop.create_task(weekly_auto_reset_task(application))
+
+    print("GOAT Bot attivo!", flush=True)
     application.run_polling()
 
 if __name__ == '__main__':
