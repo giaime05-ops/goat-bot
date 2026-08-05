@@ -61,7 +61,7 @@ def save_local_data(data):
         json.dump(data, f, indent=4)
 
 async def backup_to_telegram(context):
-    """Invia il file JSON corrente al canale di backup"""
+    """Invia il file JSON corrente al canale/gruppo di backup"""
     if not BACKUP_CHAT_ID:
         return
     try:
@@ -282,7 +282,7 @@ async def generate_summary_response(update, limit, title):
 
 # --- INIZIALIZZAZIONE ASINCRONA TASK ---
 async def post_init(application: Application):
-    """Avvia i task in background dopo l'inizializzazione corretta del loop"""
+    """Avvia i task in background dopo l'inizializzazione corretta dell'Event Loop"""
     asyncio.create_task(weekly_auto_reset_task(application))
 
 def main():
