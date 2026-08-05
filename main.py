@@ -158,6 +158,20 @@ async def handle_message(update, context):
                 parse_mode='HTML'
             )
 
+# --- COMANDO LISTA COMANDI ---
+async def show_commands(update, context):
+    text = (
+        "🤖 <b>LISTA COMANDI DI GOAT BOT</b> 🐐\n\n"
+        "👑 <b>/goatboard</b> - Mostra la classifica storica delle vittorie GOAT giornaliere.\n"
+        "📊 <b>/classificasettimana</b> - Mostra la classifica dei messaggi scritti questa settimana.\n"
+        "👑 <b>/classificaever</b> - Mostra la classifica generale dei messaggi di sempre.\n"
+        "📝 <b>/riassunto</b> - Genera un riassunto breve degli ultimi messaggi tramite IA.\n"
+        "📜 <b>/riassuntolungo</b> - Genera un riassunto esteso e dettagliato tramite IA.\n"
+        "ℹ️ <b>/goatcomm</b> - Mostra questo pannello con tutti i comandi.\n\n"
+        "💡 <i>Curiosità: Scrivi semplicemente <b>goat</b> in chat per eleggere il GOAT del giorno!</i>"
+    )
+    await update.message.reply_text(text, parse_mode='HTML')
+
 # --- CLASSIFICHE MESSAGGI ---
 def generate_ranking_text(title, ranking_dict):
     if not ranking_dict:
@@ -296,6 +310,7 @@ def main():
     application.add_handler(CommandHandler("classificaever", show_ever_ranking))
     application.add_handler(CommandHandler("riassunto", make_summary))
     application.add_handler(CommandHandler("riassuntolungo", make_long_summary))
+    application.add_handler(CommandHandler("goatcomm", show_commands))
     
     # Message Handlers
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
