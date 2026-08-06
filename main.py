@@ -14,11 +14,12 @@ logging.basicConfig(level=logging.INFO)
 
 # --- VARIABILI D'AMBIENTE ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6K6-HM9ncOwj4U51UQnC3_sLwQAqkPgZHgDRbBVnHkcDg")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID")  # Es. "-100xxxxxxxxxx"
 
-# Configurazione globale forzata di Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
+# Inizializzazione globale di Gemini con la chiave di Render
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # --- KEEP ALIVE SERVER (Flask) ---
 app = Flask('')
@@ -307,11 +308,18 @@ async def transcribe_audio(update, context):
 
     file_path = "temp_audio.ogg"
     try:
+        # Usa la stessa identica chiave di Render usata dai riassunti
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            await status_msg.edit_text("❌ Errore: GEMINI_API_KEY non configurata su Render!")
+            return
+            
+        genai.configure(api_key=api_key)
+
         audio_obj = reply_msg.voice or reply_msg.audio or reply_msg.video_note
         telegram_file = await context.bot.get_file(audio_obj.file_id)
         await telegram_file.download_to_drive(file_path)
 
-        # Upload diretto con gestione esplicita dell'API Key
         audio_file = genai.upload_file(path=file_path)
 
         prompt = (
