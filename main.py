@@ -167,6 +167,7 @@ async def show_commands(update, context):
         "👑 <b>/classificaever</b> - Mostra la classifica generale dei messaggi di sempre.\n"
         "📝 <b>/riassunto</b> - Genera un riassunto breve degli ultimi messaggi tramite IA.\n"
         "📜 <b>/riassuntolungo</b> - Genera un riassunto esteso e dettagliato tramite IA.\n"
+        "🎙️ <b>/trans</b> - Rispondi a un messaggio vocale per ottenerne la trascrizione testuale.\n"
         "ℹ️ <b>/goatcomm</b> - Mostra questo pannello con tutti i comandi.\n\n"
         "💡 <i>Curiosità: Scrivi semplicemente <b>goat</b> in chat per eleggere il GOAT del giorno!</i>"
     )
@@ -294,6 +295,49 @@ async def generate_summary_response(update, limit, title):
     except Exception as e:
         await status_msg.edit_text(f"❌ Errore riscontrato: {str(e)}")
 
+# --- COMANDO TRASCRIZIONE AUDIO ---
+async def transcribe_audio(update, context):
+    reply_msg = update.message.reply_to_message
+    if not reply_msg or not (reply_msg.voice or reply_msg.audio):
+        await update.message.reply_text("⚠️ Rispondi a un messaggio vocale con il comando `/trans` per trascriverlo!", parse_mode='Markdown')
+        return
+
+    status_msg = await update.message.reply_text("🎧 <i>Trascrizione del vocale in corso...</i>", parse_mode='HTML')
+
+    file_path = "temp_audio.ogg"
+    try:
+        audio_obj = reply_msg.voice or reply_msg.audio
+        telegram_file = await context.bot.get_file(audio_obj.file_id)
+        await telegram_file.download_to_drive(file_path)
+
+        audio_file = genai.upload_file(path=file_path)
+
+        prompt = (
+            "Trascrivi fedelmente questo audio in italiano. "
+            "Restituisci solo ed esclusivamente il testo trascritto, senza commenti aggiuntivi. "
+            "NON usare sintassi Markdown (no asterischi, cancelletti o trattini bassi)."
+        )
+
+        model = genai.GenerativeModel('gemini-3.1-flash-lite')
+        response = model.generate_content([audio_file, prompt])
+
+        try:
+            genai.delete_file(audio_file.name)
+        except Exception:
+            pass
+
+        user_name = reply_msg.from_user.first_name if reply_msg.from_user else "Utente"
+        transcript_text = f"🎙️ <b>TRASCRIZIONE VOCALE DI {user_name.upper()}</b> 📝\n\n{response.text.strip()}"
+
+        await status_msg.edit_text(transcript_text, parse_mode='HTML')
+
+    except Exception as e:
+        logging.error(f"Errore trascrizione audio: {e}")
+        await status_msg.edit_text(f"❌ Impossibile trascrivere l'audio: {str(e)}")
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
 # --- INIZIALIZZAZIONE ASINCRONA TASK ---
 async def post_init(application: Application):
     """Avvia i task in background dopo l'inizializzazione corretta dell'Event Loop"""
@@ -310,6 +354,7 @@ def main():
     application.add_handler(CommandHandler("classificaever", show_ever_ranking))
     application.add_handler(CommandHandler("riassunto", make_summary))
     application.add_handler(CommandHandler("riassuntolungo", make_long_summary))
+    application.add_handler(CommandHandler("trans", transcribe_audio))
     application.add_handler(CommandHandler("goatcomm", show_commands))
     
     # Message Handlers
