@@ -307,20 +307,28 @@ async def transcribe_audio(update, context):
     status_msg = await update.message.reply_text("🎧 <i>Trascrizione del vocale in corso...</i>", parse_mode='HTML')
 
     file_path = "temp_audio.ogg"
+    audio_file = None
+
     try:
-        # Usa la stessa identica chiave di Render usata dai riassunti
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
+        if not GEMINI_API_KEY:
             await status_msg.edit_text("❌ Errore: GEMINI_API_KEY non configurata su Render!")
             return
-            
-        genai.configure(api_key=api_key)
 
         audio_obj = reply_msg.voice or reply_msg.audio or reply_msg.video_note
         telegram_file = await context.bot.get_file(audio_obj.file_id)
         await telegram_file.download_to_drive(file_path)
 
+        # Carica il file utilizzando la configurazione globale
         audio_file = genai.upload_file(path=file_path)
+
+        # Attende l'elaborazione del file audio se in stato PROCESSING
+        while audio_file.state.name == "PROCESSING":
+            await asyncio.sleep(1)
+            audio_file = genai.get_file(audio_file.name)
+
+        if audio_file.state.name == "FAILED":
+            await status_msg.edit_text("❌ Impossibile elaborare il file audio su Gemini.")
+            return
 
         prompt = (
             "Trascrivi fedelmente questo audio in italiano. "
@@ -331,11 +339,6 @@ async def transcribe_audio(update, context):
         model = genai.GenerativeModel('gemini-3.1-flash-lite')
         response = model.generate_content([audio_file, prompt])
 
-        try:
-            genai.delete_file(audio_file.name)
-        except Exception:
-            pass
-
         user_name = reply_msg.from_user.first_name if reply_msg.from_user else "Utente"
         transcript_text = f"🎙️ <b>TRASCRIZIONE VOCALE DI {user_name.upper()}</b> 📝\n\n{response.text.strip()}"
 
@@ -345,6 +348,12 @@ async def transcribe_audio(update, context):
         logging.error(f"Errore trascrizione audio: {e}")
         await status_msg.edit_text(f"❌ Impossibile trascrivere l'audio: {str(e)}")
     finally:
+        # Pulizia file temporanei locali e remoti
+        if audio_file:
+            try:
+                genai.delete_file(audio_file.name)
+            except Exception:
+                pass
         if os.path.exists(file_path):
             os.remove(file_path)
 
