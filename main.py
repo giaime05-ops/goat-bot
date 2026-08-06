@@ -17,8 +17,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "7703471186:AAHy6y8ZUQ07rKhIQR
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6K6-HM9ncOwj4U51UQnC3_sLwQAqkPgZHgDRbBVnHkcDg")
 BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID")  # Es. "-100xxxxxxxxxx"
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# Configurazione globale forzata di Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
 
 # --- KEEP ALIVE SERVER (Flask) ---
 app = Flask('')
@@ -57,8 +57,11 @@ def load_local_data():
     return {"chats": {}}
 
 def save_local_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        logging.error(f"Errore salvataggio dati: {e}")
 
 async def backup_to_telegram(context):
     """Invia il file JSON corrente al canale/gruppo di backup"""
@@ -67,12 +70,13 @@ async def backup_to_telegram(context):
     try:
         data = load_local_data()
         save_local_data(data)
-        with open(DATA_FILE, "rb") as f:
-            await context.bot.send_document(
-                chat_id=BACKUP_CHAT_ID,
-                document=f,
-                caption=f"📦 Backup Automatico - {get_italian_now().strftime('%d/%m/%Y %H:%M:%S')}"
-            )
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=BACKUP_CHAT_ID,
+                    document=f,
+                    caption=f"📦 Backup Automatico - {get_italian_now().strftime('%d/%m/%Y %H:%M:%S')}"
+                )
     except Exception as e:
         logging.error(f"Errore durante il backup su Telegram: {e}")
 
@@ -230,7 +234,6 @@ async def show_goatboard(update, context):
 async def weekly_auto_reset_task(app):
     while True:
         now = get_italian_now()
-        # Controlla se è Domenica (weekday 6) e sono le 15:00
         if now.weekday() == 6 and now.hour == 15 and now.minute == 0:
             data = load_local_data()
             if "chats" in data:
@@ -242,8 +245,6 @@ async def weekly_auto_reset_task(app):
                             chat_info.get("msg_weekly", {})
                         )
                         await app.bot.send_message(chat_id=int(chat_id), text=text, parse_mode='HTML')
-                        
-                        # Resetta la classifica settimanale
                         chat_info["msg_weekly"] = {}
                     except Exception as e:
                         logging.error(f"Errore invio classifica automatica alla chat {chat_id}: {e}")
@@ -310,6 +311,7 @@ async def transcribe_audio(update, context):
         telegram_file = await context.bot.get_file(audio_obj.file_id)
         await telegram_file.download_to_drive(file_path)
 
+        # Upload diretto con gestione esplicita dell'API Key
         audio_file = genai.upload_file(path=file_path)
 
         prompt = (
