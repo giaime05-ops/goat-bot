@@ -81,6 +81,27 @@ async def backup_to_telegram(context):
     except Exception as e:
         logging.error(f"Errore durante il backup su Telegram: {e}")
 
+async def restore_from_telegram(app: Application):
+    """Scarica l'ultimo file di backup inviato nella chat di backup di Telegram all'avvio"""
+    if not BACKUP_CHAT_ID:
+        return
+    try:
+        logging.info("Tentativo di ripristino dati da Telegram...")
+        chat = await app.bot.get_chat(chat_id=BACKUP_CHAT_ID)
+        
+        # Cerca il file tra i messaggi fissati
+        if hasattr(chat, 'pinned_message') and chat.pinned_message and chat.pinned_message.document:
+            doc = chat.pinned_message.document
+            if doc.file_name and doc.file_name.endswith('.json'):
+                file = await app.bot.get_file(doc.file_id)
+                await file.download_to_drive(DATA_FILE)
+                logging.info("Dati ripristinati con successo dal messaggio fissato!")
+                return
+
+        logging.info("Nessun file trovato nei messaggi fissati della chat di backup.")
+    except Exception as e:
+        logging.error(f"Errore durante il ripristino da Telegram: {e}")
+
 # --- INIT E STRUTTURA CHAT ---
 def init_chat_structure(data, chat_id):
     if "chats" not in data:
@@ -116,13 +137,15 @@ async def handle_message(update, context):
         return
 
     text_content = (update.message.text or update.message.caption or "").strip()
-    username_mention = f"@{user.username}" if user.username else user.first_name
+    
+    # MODIFICA: Usa solo il Nome (First Name) senza @username per non taggare gli utenti
+    display_name = user.first_name
 
     # 1. Salva messaggio per il riassunto (fino a 500)
     if text_content:
         if chat_id not in chat_history:
             chat_history[chat_id] = []
-        chat_history[chat_id].append(f"{user.first_name}: {text_content}")
+        chat_history[chat_id].append(f"{display_name}: {text_content}")
         if len(chat_history[chat_id]) > 500:
             chat_history[chat_id].pop(0)
 
@@ -131,8 +154,8 @@ async def handle_message(update, context):
     init_chat_structure(data, chat_id)
     
     chat_info = data["chats"][chat_id]
-    chat_info["msg_weekly"][username_mention] = chat_info["msg_weekly"].get(username_mention, 0) + 1
-    chat_info["msg_ever"][username_mention] = chat_info["msg_ever"].get(username_mention, 0) + 1
+    chat_info["msg_weekly"][display_name] = chat_info["msg_weekly"].get(display_name, 0) + 1
+    chat_info["msg_ever"][display_name] = chat_info["msg_ever"].get(display_name, 0) + 1
     
     save_local_data(data)
 
@@ -142,16 +165,16 @@ async def handle_message(update, context):
 
         if chat_info["last_date"] != today:
             chat_info["last_date"] = today
-            chat_info["today_winner"] = username_mention
+            chat_info["today_winner"] = display_name
             
-            current_score = chat_info["leaderboard"].get(username_mention, 0)
-            chat_info["leaderboard"][username_mention] = current_score + 1
+            current_score = chat_info["leaderboard"].get(display_name, 0)
+            chat_info["leaderboard"][display_name] = current_score + 1
             save_local_data(data)
             
             # Esegue il backup su Telegram
             await backup_to_telegram(context)
 
-            total_wins = chat_info["leaderboard"][username_mention]
+            total_wins = chat_info["leaderboard"][display_name]
             await update.message.reply_text(
                 f"Sei il GOAT del giorno 🐐!\n🏆 Vittorie totali: <b>{total_wins}</b>",
                 parse_mode='HTML'
@@ -307,7 +330,6 @@ async def transcribe_audio(update, context):
     status_msg = await update.message.reply_text("🎧 <i>Trascrizione del vocale in corso...</i>", parse_mode='HTML')
 
     file_path = "temp_audio.ogg"
-    audio_file = None
 
     try:
         if not GEMINI_API_KEY:
@@ -318,17 +340,13 @@ async def transcribe_audio(update, context):
         telegram_file = await context.bot.get_file(audio_obj.file_id)
         await telegram_file.download_to_drive(file_path)
 
-        # Carica il file utilizzando la configurazione globale
-        audio_file = genai.upload_file(path=file_path)
+        with open(file_path, "rb") as f:
+            audio_bytes = f.read()
 
-        # Attende l'elaborazione del file audio se in stato PROCESSING
-        while audio_file.state.name == "PROCESSING":
-            await asyncio.sleep(1)
-            audio_file = genai.get_file(audio_file.name)
-
-        if audio_file.state.name == "FAILED":
-            await status_msg.edit_text("❌ Impossibile elaborare il file audio su Gemini.")
-            return
+        audio_blob = {
+            "mime_type": "audio/ogg",
+            "data": audio_bytes
+        }
 
         prompt = (
             "Trascrivi fedelmente questo audio in italiano. "
@@ -337,7 +355,7 @@ async def transcribe_audio(update, context):
         )
 
         model = genai.GenerativeModel('gemini-3.1-flash-lite')
-        response = model.generate_content([audio_file, prompt])
+        response = model.generate_content([prompt, audio_blob])
 
         user_name = reply_msg.from_user.first_name if reply_msg.from_user else "Utente"
         transcript_text = f"🎙️ <b>TRASCRIZIONE VOCALE DI {user_name.upper()}</b> 📝\n\n{response.text.strip()}"
@@ -348,18 +366,13 @@ async def transcribe_audio(update, context):
         logging.error(f"Errore trascrizione audio: {e}")
         await status_msg.edit_text(f"❌ Impossibile trascrivere l'audio: {str(e)}")
     finally:
-        # Pulizia file temporanei locali e remoti
-        if audio_file:
-            try:
-                genai.delete_file(audio_file.name)
-            except Exception:
-                pass
         if os.path.exists(file_path):
             os.remove(file_path)
 
-# --- INIZIALIZZAZIONE ASINCRONA TASK ---
+# --- INIZIALIZZAZIONE ASINCRONA TASK E RIPRISTINO ---
 async def post_init(application: Application):
-    """Avvia i task in background dopo l'inizializzazione corretta dell'Event Loop"""
+    """Avvia il ripristino dei dati e i task in background dopo l'inizializzazione"""
+    await restore_from_telegram(application)
     asyncio.create_task(weekly_auto_reset_task(application))
 
 def main():
