@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 
 # --- VARIABILI D'AMBIENTE ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6K6-HM9ncOwj4U51UQnC3_sLwQAqkPgZHgDRbBVnHkcDg")
 BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID")  # Es. "-100xxxxxxxxxx"
 
 if GEMINI_API_KEY:
@@ -103,7 +103,7 @@ async def handle_message(update, context):
     user = update.message.from_user
     chat_id = str(update.effective_chat.id)
 
-    # UTILS: Stampa nei Log di Render l'ID della chat (utile per recuperare l'ID del gruppo di backup)
+    # UTILS: Stampa nei Log di Render l'ID della chat
     print(f"--- ID CHAT RILEVATO: {chat_id} ---", flush=True)
 
     # IGNORA TUTTI I BOT DAL CONTEGGIO MESSAGGI
@@ -286,7 +286,7 @@ async def generate_summary_response(update, limit, title):
             f"Ecco i messaggi:\n{conversation_text}"
         )
 
-        model = genai.GenerativeModel('gemini-3.1-flash-lite')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(prompt)
         
         summary_text = f"📝 <b>{title} DELLA CHAT</b> 🤖\n\n{response.text}"
@@ -298,7 +298,7 @@ async def generate_summary_response(update, limit, title):
 # --- COMANDO TRASCRIZIONE AUDIO ---
 async def transcribe_audio(update, context):
     reply_msg = update.message.reply_to_message
-    if not reply_msg or not (reply_msg.voice or reply_msg.audio):
+    if not reply_msg or not (reply_msg.voice or reply_msg.audio or reply_msg.video_note):
         await update.message.reply_text("⚠️ Rispondi a un messaggio vocale con il comando `/trans` per trascriverlo!", parse_mode='Markdown')
         return
 
@@ -306,7 +306,7 @@ async def transcribe_audio(update, context):
 
     file_path = "temp_audio.ogg"
     try:
-        audio_obj = reply_msg.voice or reply_msg.audio
+        audio_obj = reply_msg.voice or reply_msg.audio or reply_msg.video_note
         telegram_file = await context.bot.get_file(audio_obj.file_id)
         await telegram_file.download_to_drive(file_path)
 
@@ -318,7 +318,7 @@ async def transcribe_audio(update, context):
             "NON usare sintassi Markdown (no asterischi, cancelletti o trattini bassi)."
         )
 
-        model = genai.GenerativeModel('gemini-3.1-flash-lite')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content([audio_file, prompt])
 
         try:
