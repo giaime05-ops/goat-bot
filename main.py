@@ -13,7 +13,7 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO)
 
 # --- VARIABILI D'AMBIENTE ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "7703471186:AAHy6y8ZUQ07rKhIQRVtDptuhT5X7a5aF7I")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID")  # Es. "-100xxxxxxxxxx"
 
@@ -288,7 +288,7 @@ async def generate_summary_response(update, limit, title):
             f"Ecco i messaggi:\n{conversation_text}"
         )
 
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-3.1-flash-lite')
         response = model.generate_content(prompt)
         
         summary_text = f"📝 <b>{title} DELLA CHAT</b> 🤖\n\n{response.text}"
@@ -328,7 +328,7 @@ async def transcribe_audio(update, context):
             "NON usare sintassi Markdown (no asterischi, cancelletti o trattini bassi)."
         )
 
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-3.1-flash-lite')
         response = model.generate_content([audio_file, prompt])
 
         try:
