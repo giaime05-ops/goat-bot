@@ -137,11 +137,9 @@ async def handle_message(update, context):
         return
 
     text_content = (update.message.text or update.message.caption or "").strip()
-    
-    # MODIFICA: Usa solo il Nome (First Name) senza @username per non taggare gli utenti
     display_name = user.first_name
 
-    # 1. Salva messaggio per il riassunto (fino a 500)
+    # 1. Salva messaggio per il riassunto (solo se contiene testo/didascalia)
     if text_content:
         if chat_id not in chat_history:
             chat_history[chat_id] = []
@@ -149,7 +147,7 @@ async def handle_message(update, context):
         if len(chat_history[chat_id]) > 500:
             chat_history[chat_id].pop(0)
 
-    # 2. Registra conteggio messaggi (Settimanale & Ever)
+    # 2. Registra conteggio per QUALSIASI messaggio (Testo, Foto, GIF, Sticker, Vocali, ecc.)
     data = load_local_data()
     init_chat_structure(data, chat_id)
     
@@ -159,7 +157,7 @@ async def handle_message(update, context):
     
     save_local_data(data)
 
-    # 3. Logica GOAT
+    # 3. Logica GOAT (solo se il contenuto testuale è la parola "goat")
     if text_content.lower() == "goat":
         today = get_italian_date()
 
@@ -186,6 +184,32 @@ async def handle_message(update, context):
                 parse_mode='HTML'
             )
 
+# --- COMANDI RESET ---
+async def reset_goatboard(update, context):
+    chat_id = str(update.effective_chat.id)
+    data = load_local_data()
+    init_chat_structure(data, chat_id)
+
+    data["chats"][chat_id]["leaderboard"] = {}
+    data["chats"][chat_id]["last_date"] = None
+    data["chats"][chat_id]["today_winner"] = None
+    save_local_data(data)
+
+    await backup_to_telegram(context)
+    await update.message.reply_text("🧹 Classifica GOAT azzerata con successo!", parse_mode='HTML')
+
+async def reset_msgboard(update, context):
+    chat_id = str(update.effective_chat.id)
+    data = load_local_data()
+    init_chat_structure(data, chat_id)
+
+    data["chats"][chat_id]["msg_weekly"] = {}
+    data["chats"][chat_id]["msg_ever"] = {}
+    save_local_data(data)
+
+    await backup_to_telegram(context)
+    await update.message.reply_text("🧹 Classifiche dei messaggi (settimanale ed ever) azzerate!", parse_mode='HTML')
+
 # --- COMANDO LISTA COMANDI ---
 async def show_commands(update, context):
     text = (
@@ -197,6 +221,8 @@ async def show_commands(update, context):
         "📜 <b>/riassuntolungo</b> - Genera un riassunto esteso e dettagliato tramite IA.\n"
         "🎙️ <b>/trans</b> - Rispondi a un messaggio vocale per ottenerne la trascrizione testuale.\n"
         "ℹ️ <b>/goatcomm</b> - Mostra questo pannello con tutti i comandi.\n\n"
+        "🧹 <b>/resetgoat</b> - Azzera la classifica GOAT del gruppo.\n"
+        "🧹 <b>/resetmsg</b> - Azzera le classifiche dei messaggi.\n\n"
         "💡 <i>Curiosità: Scrivi semplicemente <b>goat</b> in chat per eleggere il GOAT del giorno!</i>"
     )
     await update.message.reply_text(text, parse_mode='HTML')
@@ -388,6 +414,8 @@ def main():
     application.add_handler(CommandHandler("riassuntolungo", make_long_summary))
     application.add_handler(CommandHandler("trans", transcribe_audio))
     application.add_handler(CommandHandler("goatcomm", show_commands))
+    application.add_handler(CommandHandler("resetgoat", reset_goatboard))
+    application.add_handler(CommandHandler("resetmsg", reset_msgboard))
     
     # Message Handlers
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
