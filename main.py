@@ -80,10 +80,22 @@ async def backup_to_telegram(context):
         save_local_data(data)
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, "rb") as f:
-                await context.bot.send_document(
+                sent = await context.bot.send_document(
                     chat_id=BACKUP_CHAT_ID,
                     document=f,
                     caption=f"📦 Backup Automatico - {get_italian_now().strftime('%d/%m/%Y %H:%M:%S')}"
+                )
+            # Fissa in automatico l'ultimo backup: il ripristino all'avvio legge proprio il messaggio fissato.
+            # Il nuovo pin sostituisce quello precedente. Serve che il bot sia admin con permesso di fissare.
+            try:
+                await context.bot.pin_chat_message(
+                    chat_id=BACKUP_CHAT_ID,
+                    message_id=sent.message_id,
+                    disable_notification=True
+                )
+            except Exception as e:
+                logging.error(
+                    f"Backup inviato ma impossibile fissarlo (il bot è admin con permesso di fissare messaggi?): {e}"
                 )
     except Exception as e:
         logging.error(f"Errore durante il backup su Telegram: {e}")
@@ -231,10 +243,12 @@ async def handle_big_message(update, context):
     user = update.message.from_user
     chat_id = str(update.effective_chat.id)
 
-    text_content = (update.message.text or update.message.caption or "").strip()
+    # Solo il TESTO del messaggio (niente didascalie di foto/video) e solo se è
+    # esattamente la parola "stallone" (maiuscole/minuscole e spazi ai bordi ininfluenti).
+    # Qualsiasi altra cosa -> il bot non risponde affatto.
+    text_content = (update.message.text or "").strip()
 
-    # Nessun salvataggio di messaggi, nessun conteggio, nessuna cronologia:
-    # l'unico messaggio che interessa è la parola "stallone".
+    # Nessun salvataggio di messaggi, nessun conteggio, nessuna cronologia.
     if text_content.lower() != "stallone":
         return
 
@@ -258,13 +272,13 @@ async def handle_big_message(update, context):
 
         total_wins = chat_info["stallone_leaderboard"][display_name]
         await update.message.reply_text(
-            f"Sei il Re Stallone del giorno!\n🏆 Vittorie totali: <b>{total_wins}</b>",
+            f"Sei il Re Stallone del giorno! 🐎\n🏆 Vittorie totali: <b>{total_wins}</b>",
             parse_mode='HTML'
         )
     else:
         current_stallone = chat_info["stallone_winner"]
         await update.message.reply_text(
-            f"Già <b>{current_stallone}</b> è il Re Stallone del giorno!",
+            f"Già <b>{current_stallone}</b> è il Re Stallone del giorno! 🐎",
             parse_mode='HTML'
         )
 
