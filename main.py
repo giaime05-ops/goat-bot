@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 import logging
 from datetime import datetime
@@ -23,6 +24,12 @@ BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID")  # Es. "-100xxxxxxxxxx"
 HISTORIC_CHAT_ID = "-1001901647268"
 # GRUPPO GRANDE: parola "stallone", nessun conteggio messaggi, solo /stalloneboard.
 BIG_CHAT_ID = "-1001520340812"
+
+# GRUPPO GRANDE: dopo che il titolo è stato assegnato, il messaggio "Già X è il Re Stallone"
+# viene inviato al massimo UNA volta ogni tot secondi, così una raffica di "stallone"
+# (es. a mezzanotte) non genera decine di risposte identiche.
+ALREADY_REPLY_COOLDOWN = 30  # secondi
+last_already_reply = {}      # chat_id -> istante dell'ultimo "Già X" inviato
 
 # Inizializzazione globale di Gemini con la chiave di Render
 if GEMINI_API_KEY:
@@ -320,6 +327,8 @@ async def handle_big_message(update, context):
         save_local_data(data)
 
         total_wins = chat_info["stallone_leaderboard"][display_name]
+        # Nuovo giorno, nuovo vincitore: azzera l'anti-raffica dei "Già X"
+        last_already_reply.pop(chat_id, None)
         # Prima la risposta (subito), poi il backup in background
         await update.message.reply_text(
             f"Sei il Re Stallone del giorno! 🐎\n🏆 Vittorie totali: <b>{total_wins}</b>",
@@ -327,11 +336,17 @@ async def handle_big_message(update, context):
         )
         spawn(backup_to_telegram(context))
     elif today == last_date:
-        current_stallone = chat_info["stallone_winner"]
-        await update.message.reply_text(
-            f"Già <b>{current_stallone}</b> è il Re Stallone del giorno! 🐎",
-            parse_mode='HTML'
-        )
+        # Una sola risposta "Già X" per raffica: i messaggi che arrivano entro
+        # ALREADY_REPLY_COOLDOWN secondi dall'ultima risposta restano senza risposta.
+        now_ts = time.monotonic()
+        last_reply_ts = last_already_reply.get(chat_id)
+        if last_reply_ts is None or now_ts - last_reply_ts >= ALREADY_REPLY_COOLDOWN:
+            last_already_reply[chat_id] = now_ts
+            current_stallone = chat_info["stallone_winner"]
+            await update.message.reply_text(
+                f"Già <b>{current_stallone}</b> è il Re Stallone del giorno! 🐎",
+                parse_mode='HTML'
+            )
     # Se il messaggio è di un giorno precedente all'ultimo assegnato: ignorato.
 
 # --- COMANDO GRUPPO GRANDE: CLASSIFICA STALLONE ---
