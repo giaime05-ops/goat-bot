@@ -14,6 +14,10 @@ import google.generativeai as genai
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
+# httpx/httpcore, a livello INFO, scrivono nei log l'URL completo di ogni richiesta a Telegram,
+# che contiene il TOKEN del bot: li silenziamo (restano visibili solo warning ed errori).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # --- VARIABILI D'AMBIENTE ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # Bot storico (GoatBot): gruppo storico
