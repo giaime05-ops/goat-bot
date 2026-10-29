@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import signal
 import asyncio
 import logging
 from datetime import datetime
@@ -15,7 +16,10 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO)
 
 # --- VARIABILI D'AMBIENTE ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # Bot storico (GoatBot): gruppo storico
+# Token del SECONDO bot, dedicato al gruppo grande (stallone). Se manca, il bot storico
+# gestisce da solo entrambi i gruppi (modalità a bot singolo).
+TELEGRAM_TOKEN_BIG = os.environ.get("TELEGRAM_TOKEN_BIG")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID")  # Es. "-100xxxxxxxxxx"
 
@@ -86,6 +90,10 @@ def spawn(coro):
 
 backup_lock = asyncio.Lock()  # un solo backup alla volta
 
+# Bot usato per i backup. Con due bot è sempre il bot storico, così solo lui deve essere
+# nel gruppo di backup (admin con permesso di fissare). Se None, si usa il bot del contesto.
+BACKUP_BOT = None
+
 def load_local_data():
     if os.path.exists(DATA_FILE):
         try:
@@ -107,6 +115,7 @@ async def backup_to_telegram(context):
     if not BACKUP_CHAT_ID:
         return
     async with backup_lock:
+        bot = BACKUP_BOT or context.bot
         try:
             data = load_local_data()
             save_local_data(data)
@@ -117,7 +126,7 @@ async def backup_to_telegram(context):
             # Telegram NON sgancia da solo i pin precedenti: vanno tolti esplicitamente.
             old_pinned_id = None
             try:
-                chat = await context.bot.get_chat(chat_id=BACKUP_CHAT_ID)
+                chat = await bot.get_chat(chat_id=BACKUP_CHAT_ID)
                 pinned = getattr(chat, "pinned_message", None)
                 if pinned and pinned.document and pinned.document.file_name \
                         and pinned.document.file_name.endswith(".json"):
@@ -126,7 +135,7 @@ async def backup_to_telegram(context):
                 logging.error(f"Impossibile leggere il messaggio fissato attuale: {e}")
 
             with open(DATA_FILE, "rb") as f:
-                sent = await context.bot.send_document(
+                sent = await bot.send_document(
                     chat_id=BACKUP_CHAT_ID,
                     document=f,
                     caption=f"📦 Backup Automatico - {get_italian_now().strftime('%d/%m/%Y %H:%M:%S')}"
@@ -135,14 +144,14 @@ async def backup_to_telegram(context):
             # Fissa in automatico l'ultimo backup (il ripristino all'avvio legge il messaggio fissato)
             # e toglie il pin al backup precedente. Serve che il bot sia admin con permesso di fissare.
             try:
-                await context.bot.pin_chat_message(
+                await bot.pin_chat_message(
                     chat_id=BACKUP_CHAT_ID,
                     message_id=sent.message_id,
                     disable_notification=True
                 )
                 if old_pinned_id and old_pinned_id != sent.message_id:
                     try:
-                        await context.bot.unpin_chat_message(
+                        await bot.unpin_chat_message(
                             chat_id=BACKUP_CHAT_ID,
                             message_id=old_pinned_id
                         )
@@ -221,17 +230,24 @@ def only_in(allowed_chat_id):
     return decorator
 
 # --- GESTIONE MESSAGGI (SMISTAMENTO PER CHAT) ---
-async def handle_message(update, context):
+async def handle_message(update, context, allowed=None):
+    """
+    allowed: insieme di ID chat che QUESTO bot deve gestire (None = entrambi i gruppi).
+    Con due bot, il bot storico gestisce solo il gruppo storico e il bot nuovo solo il gruppo grande.
+    """
     if not update.message or not update.message.from_user:
         return
 
     chat_id = str(update.effective_chat.id)
 
-    # UTILS: Stampa nei Log di Render l'ID della chat
+    # UTILS: Stampa nei Log l'ID della chat
     print(f"--- ID CHAT RILEVATO: {chat_id} ---", flush=True)
 
     # IGNORA TUTTI I BOT
     if update.message.from_user.is_bot:
+        return
+
+    if allowed is not None and chat_id not in allowed:
         return
 
     if chat_id == HISTORIC_CHAT_ID:
@@ -606,14 +622,15 @@ async def post_init(application: Application):
     await restore_from_telegram(application)
     asyncio.create_task(weekly_auto_reset_task(application))
 
-def main():
-    keep_alive()
+def make_message_handler(allowed):
+    """Crea il gestore messaggi limitato agli ID chat indicati."""
+    async def _handler(update, context):
+        await handle_message(update, context, allowed=allowed)
+    return _handler
 
-    application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-
-    # Registrazione Comandi
+def register_historic_handlers(application, also_big):
+    """Gestori del bot storico. also_big=True solo in modalità a bot singolo (anche gruppo grande)."""
     # Ogni comando è protetto da @only_in: fuori dalla chat autorizzata viene ignorato in silenzio.
-    # -- Gruppo storico --
     application.add_handler(CommandHandler("goatboard", show_goatboard))
     application.add_handler(CommandHandler("classificasettimana", show_weekly_ranking))
     application.add_handler(CommandHandler("classificaever", show_ever_ranking))
@@ -623,11 +640,82 @@ def main():
     application.add_handler(CommandHandler("goatcomm", show_commands))
     application.add_handler(CommandHandler("resetgoat", reset_goatboard))
     application.add_handler(CommandHandler("resetmsg", reset_msgboard))
-    # -- Gruppo grande --
-    application.add_handler(CommandHandler("stalloneboard", show_stalloneboard))
+    allowed = {HISTORIC_CHAT_ID}
+    if also_big:
+        application.add_handler(CommandHandler("stalloneboard", show_stalloneboard))
+        allowed.add(BIG_CHAT_ID)
+    # Message Handler (i comandi sono esclusi: non vengono mai contati)
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, make_message_handler(allowed)))
 
-    # Message Handlers (i comandi sono esclusi: non vengono mai contati)
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+def register_big_handlers(application):
+    """Gestori del bot del gruppo grande: solo /stalloneboard e la parola "stallone"."""
+    application.add_handler(CommandHandler("stalloneboard", show_stalloneboard))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, make_message_handler({BIG_CHAT_ID})))
+
+async def run_two_bots():
+    """Avvia insieme il bot storico (TELEGRAM_TOKEN) e il bot del gruppo grande (TELEGRAM_TOKEN_BIG)."""
+    global BACKUP_BOT
+
+    historic_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    big_app = Application.builder().token(TELEGRAM_TOKEN_BIG).build()
+    register_historic_handlers(historic_app, also_big=False)
+    register_big_handlers(big_app)
+    apps = [historic_app, big_app]
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    initialized, started = [], []
+    weekly_task = None
+    try:
+        for a in apps:
+            await a.initialize()
+            initialized.append(a)
+
+        # I backup partono sempre dal bot storico (l'unico presente nel gruppo di backup)
+        BACKUP_BOT = historic_app.bot
+        await restore_from_telegram(historic_app)
+        weekly_task = asyncio.create_task(weekly_auto_reset_task(historic_app))
+
+        for a in apps:
+            await a.start()
+            started.append(a)
+            await a.updater.start_polling()
+
+        print("GOAT Bot attivo! (2 bot: storico + gruppo grande)", flush=True)
+        await stop_event.wait()
+    finally:
+        if weekly_task:
+            weekly_task.cancel()
+        for a in reversed(started):
+            try:
+                if a.updater and a.updater.running:
+                    await a.updater.stop()
+                await a.stop()
+            except Exception as e:
+                logging.error(f"Errore durante l'arresto del bot: {e}")
+        for a in reversed(initialized):
+            try:
+                await a.shutdown()
+            except Exception as e:
+                logging.error(f"Errore durante lo shutdown del bot: {e}")
+
+def main():
+    keep_alive()
+
+    if TELEGRAM_TOKEN_BIG:
+        # Due bot nello stesso programma, stessi dati (goat_data.json) e stesso gruppo di backup
+        asyncio.run(run_two_bots())
+        return
+
+    # Modalità a bot singolo: il bot storico gestisce entrambi i gruppi
+    application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    register_historic_handlers(application, also_big=True)
 
     print("GOAT Bot attivo!", flush=True)
     application.run_polling()
