@@ -55,6 +55,30 @@ def get_italian_date():
     """Restituisce la data odierna esatta in Italia (YYYY-MM-DD)"""
     return str(get_italian_now().date())
 
+def get_message_date(update):
+    """
+    Data italiana (YYYY-MM-DD) in cui l'utente ha SCRITTO il messaggio (orario di Telegram),
+    non quella in cui il bot lo elabora: così un messaggio delle 23:59:59 resta del giorno prima
+    anche se il bot lo processa con qualche secondo di ritardo (o dopo un riavvio).
+    """
+    msg_dt = getattr(update.message, "date", None)
+    if msg_dt is None:
+        return get_italian_date()
+    return str(msg_dt.astimezone(ZoneInfo("Europe/Rome")).date())
+
+# --- TASK IN BACKGROUND ---
+# I lavori lenti (IA, backup) girano in background, così il bot resta subito libero
+# di rispondere agli altri messaggi (es. "stallone" a mezzanotte).
+background_tasks = set()
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
+backup_lock = asyncio.Lock()  # un solo backup alla volta
+
 def load_local_data():
     if os.path.exists(DATA_FILE):
         try:
@@ -75,30 +99,54 @@ async def backup_to_telegram(context):
     """Invia il file JSON corrente al canale/gruppo di backup"""
     if not BACKUP_CHAT_ID:
         return
-    try:
-        data = load_local_data()
-        save_local_data(data)
-        if os.path.exists(DATA_FILE):
+    async with backup_lock:
+        try:
+            data = load_local_data()
+            save_local_data(data)
+            if not os.path.exists(DATA_FILE):
+                return
+
+            # Ricorda il vecchio backup fissato (solo se è un file .json), per toglierlo dopo il nuovo pin.
+            # Telegram NON sgancia da solo i pin precedenti: vanno tolti esplicitamente.
+            old_pinned_id = None
+            try:
+                chat = await context.bot.get_chat(chat_id=BACKUP_CHAT_ID)
+                pinned = getattr(chat, "pinned_message", None)
+                if pinned and pinned.document and pinned.document.file_name \
+                        and pinned.document.file_name.endswith(".json"):
+                    old_pinned_id = pinned.message_id
+            except Exception as e:
+                logging.error(f"Impossibile leggere il messaggio fissato attuale: {e}")
+
             with open(DATA_FILE, "rb") as f:
                 sent = await context.bot.send_document(
                     chat_id=BACKUP_CHAT_ID,
                     document=f,
                     caption=f"📦 Backup Automatico - {get_italian_now().strftime('%d/%m/%Y %H:%M:%S')}"
                 )
-            # Fissa in automatico l'ultimo backup: il ripristino all'avvio legge proprio il messaggio fissato.
-            # Il nuovo pin sostituisce quello precedente. Serve che il bot sia admin con permesso di fissare.
+
+            # Fissa in automatico l'ultimo backup (il ripristino all'avvio legge il messaggio fissato)
+            # e toglie il pin al backup precedente. Serve che il bot sia admin con permesso di fissare.
             try:
                 await context.bot.pin_chat_message(
                     chat_id=BACKUP_CHAT_ID,
                     message_id=sent.message_id,
                     disable_notification=True
                 )
+                if old_pinned_id and old_pinned_id != sent.message_id:
+                    try:
+                        await context.bot.unpin_chat_message(
+                            chat_id=BACKUP_CHAT_ID,
+                            message_id=old_pinned_id
+                        )
+                    except Exception as e:
+                        logging.error(f"Impossibile togliere il pin al vecchio backup: {e}")
             except Exception as e:
                 logging.error(
                     f"Backup inviato ma impossibile fissarlo (il bot è admin con permesso di fissare messaggi?): {e}"
                 )
-    except Exception as e:
-        logging.error(f"Errore durante il backup su Telegram: {e}")
+        except Exception as e:
+            logging.error(f"Errore durante il backup su Telegram: {e}")
 
 async def restore_from_telegram(app: Application):
     """Scarica l'ultimo file di backup inviato nella chat di backup di Telegram all'avvio"""
@@ -213,9 +261,11 @@ async def handle_historic_message(update, context):
 
     # 3. Logica GOAT (solo se il contenuto testuale è la parola "goat")
     if text_content.lower() == "goat":
-        today = get_italian_date()
+        # Il giorno conta dall'orario in cui il messaggio è stato scritto (non da quando il bot lo elabora)
+        today = get_message_date(update)
+        last_date = chat_info["last_date"]
 
-        if chat_info["last_date"] != today:
+        if last_date is None or today > last_date:
             chat_info["last_date"] = today
             chat_info["today_winner"] = display_name
 
@@ -223,20 +273,20 @@ async def handle_historic_message(update, context):
             chat_info["leaderboard"][display_name] = current_score + 1
             save_local_data(data)
 
-            # Esegue il backup su Telegram
-            await backup_to_telegram(context)
-
             total_wins = chat_info["leaderboard"][display_name]
+            # Prima la risposta (subito), poi il backup in background
             await update.message.reply_text(
                 f"Sei il GOAT del giorno 🐐!\n🏆 Vittorie totali: <b>{total_wins}</b>",
                 parse_mode='HTML'
             )
-        else:
+            spawn(backup_to_telegram(context))
+        elif today == last_date:
             current_goat = chat_info["today_winner"]
             await update.message.reply_text(
                 f"Già <b>{current_goat}</b> è il Goat del giorno 🐐",
                 parse_mode='HTML'
             )
+        # Se il messaggio è di un giorno precedente all'ultimo assegnato: ignorato.
 
 # --- GRUPPO GRANDE: STALLONE (NESSUN CONTEGGIO MESSAGGI) ---
 async def handle_big_message(update, context):
@@ -253,13 +303,15 @@ async def handle_big_message(update, context):
         return
 
     display_name = user.first_name
-    today = get_italian_date()
+    # Il giorno conta dall'orario in cui il messaggio è stato scritto (non da quando il bot lo elabora)
+    today = get_message_date(update)
 
     data = load_local_data()
     init_chat_structure(data, chat_id)
     chat_info = data["chats"][chat_id]
+    last_date = chat_info["stallone_last_date"]
 
-    if chat_info["stallone_last_date"] != today:
+    if last_date is None or today > last_date:
         chat_info["stallone_last_date"] = today
         chat_info["stallone_winner"] = display_name
 
@@ -267,20 +319,20 @@ async def handle_big_message(update, context):
         chat_info["stallone_leaderboard"][display_name] = current_score + 1
         save_local_data(data)
 
-        # Esegue il backup su Telegram
-        await backup_to_telegram(context)
-
         total_wins = chat_info["stallone_leaderboard"][display_name]
+        # Prima la risposta (subito), poi il backup in background
         await update.message.reply_text(
             f"Sei il Re Stallone del giorno! 🐎\n🏆 Vittorie totali: <b>{total_wins}</b>",
             parse_mode='HTML'
         )
-    else:
+        spawn(backup_to_telegram(context))
+    elif today == last_date:
         current_stallone = chat_info["stallone_winner"]
         await update.message.reply_text(
             f"Già <b>{current_stallone}</b> è il Re Stallone del giorno! 🐎",
             parse_mode='HTML'
         )
+    # Se il messaggio è di un giorno precedente all'ultimo assegnato: ignorato.
 
 # --- COMANDO GRUPPO GRANDE: CLASSIFICA STALLONE ---
 @only_in(BIG_CHAT_ID)
@@ -438,11 +490,13 @@ async def weekly_auto_reset_task(app):
 # --- COMANDI RIASSUNTO GEMINI (SOLO GRUPPO STORICO) ---
 @only_in(HISTORIC_CHAT_ID)
 async def make_summary(update, context):
-    await generate_summary_response(update, limit=75, title="RIASSUNTO BREVE")
+    # In background: il bot resta subito libero per gli altri messaggi
+    spawn(generate_summary_response(update, limit=75, title="RIASSUNTO BREVE"))
 
 @only_in(HISTORIC_CHAT_ID)
 async def make_long_summary(update, context):
-    await generate_summary_response(update, limit=500, title="RIASSUNTO ESTESO")
+    # In background: il bot resta subito libero per gli altri messaggi
+    spawn(generate_summary_response(update, limit=500, title="RIASSUNTO ESTESO"))
 
 async def generate_summary_response(update, limit, title):
     chat_id = str(update.effective_chat.id)
@@ -467,7 +521,8 @@ async def generate_summary_response(update, limit, title):
         )
 
         model = genai.GenerativeModel('gemini-3.1-flash-lite')
-        response = model.generate_content(prompt)
+        # Chiamata bloccante eseguita in un thread, per non fermare il bot
+        response = await asyncio.to_thread(model.generate_content, prompt)
 
         summary_text = f"📝 <b>{title} DELLA CHAT</b> 🤖\n\n{response.text}"
         await status_msg.edit_text(summary_text, parse_mode='HTML')
@@ -483,9 +538,14 @@ async def transcribe_audio(update, context):
         await update.message.reply_text("⚠️ Rispondi a un messaggio vocale con il comando `/trans` per trascriverlo!", parse_mode='Markdown')
         return
 
+    # In background: il bot resta subito libero per gli altri messaggi
+    spawn(run_transcription(update, context, reply_msg))
+
+async def run_transcription(update, context, reply_msg):
     status_msg = await update.message.reply_text("🎧 <i>Trascrizione del vocale in corso...</i>", parse_mode='HTML')
 
-    file_path = "temp_audio.ogg"
+    # Nome file unico per messaggio: due trascrizioni insieme non si pestano i piedi
+    file_path = f"temp_audio_{update.message.message_id}.ogg"
 
     try:
         if not GEMINI_API_KEY:
@@ -511,7 +571,7 @@ async def transcribe_audio(update, context):
         )
 
         model = genai.GenerativeModel('gemini-3.1-flash-lite')
-        response = model.generate_content([prompt, audio_blob])
+        response = await asyncio.to_thread(model.generate_content, [prompt, audio_blob])
 
         user_name = reply_msg.from_user.first_name if reply_msg.from_user else "Utente"
         transcript_text = f"🎙️ <b>TRASCRIZIONE VOCALE DI {user_name.upper()}</b> 📝\n\n{response.text.strip()}"
