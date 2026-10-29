@@ -28,7 +28,7 @@ BIG_CHAT_ID = "-1001520340812"
 # GRUPPO GRANDE: dopo che il titolo è stato assegnato, il messaggio "Già X è il Re Stallone"
 # viene inviato al massimo UNA volta ogni tot secondi, così una raffica di "stallone"
 # (es. a mezzanotte) non genera decine di risposte identiche.
-ALREADY_REPLY_COOLDOWN = 30  # secondi
+ALREADY_REPLY_COOLDOWN = 20  # secondi
 last_already_reply = {}      # chat_id -> istante dell'ultimo "Già X" inviato
 
 # Inizializzazione globale di Gemini con la chiave di Render
