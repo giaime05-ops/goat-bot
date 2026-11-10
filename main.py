@@ -1116,7 +1116,8 @@ def build_group_panel(data, chat_id):
             enabled = feature_enabled(info, key)
             text += f"\n• {label} — <i>{escape(commands)}</i>"
             rows.append([InlineKeyboardButton(f"{'✅' if enabled else '❌'} {label}", callback_data=f"t:{chat_id}:{key}")])
-        rows.append([InlineKeyboardButton("🚪 Esci dal gruppo", callback_data=f"x:{chat_id}")])
+        rows.append([InlineKeyboardButton("⏸ Sospendi (resta ma inattivo)", callback_data=f"s:{chat_id}")])
+        rows.append([InlineKeyboardButton("⛔ Revoca accesso (il bot esce)", callback_data=f"x:{chat_id}")])
     elif status == STATUS_PENDING:
         text += "\nIl bot è inattivo in questo gruppo finché non decidi."
         rows.append([
@@ -1124,9 +1125,30 @@ def build_group_panel(data, chat_id):
             InlineKeyboardButton("⛔ Nega", callback_data=f"d:{chat_id}"),
         ])
     else:
-        text += "\nIl bot è uscito da questo gruppo. Per riattivarlo, aggiungilo di nuovo: ti arriverà una nuova richiesta."
+        text += (
+            "\nAccesso revocato: il bot è uscito (o dovrebbe esserlo). Per riattivarlo aggiungilo di nuovo al gruppo: "
+            "ti arriverà una nuova richiesta. Se è ancora nel gruppo, puoi riconsentire da qui."
+        )
+        rows.append([InlineKeyboardButton("✅ Consenti di nuovo", callback_data=f"a:{chat_id}")])
     rows.append(back)
     return text, InlineKeyboardMarkup(rows)
+
+async def refresh_titles(context, data):
+    """Completa i nomi dei gruppi che ancora non lo hanno (chiedendoli a Telegram). True se qualcosa è cambiato."""
+    changed = False
+    for chat_id, info in managed_chats(data):
+        if info.get("title"):
+            continue
+        try:
+            chat = await context.bot.get_chat(chat_id=int(chat_id))
+            if getattr(chat, "title", None):
+                info["title"] = chat.title
+                changed = True
+        except Exception as e:
+            logging.info(f"Nome del gruppo {chat_id} non disponibile: {e}")
+    if changed:
+        save_local_data(data)
+    return changed
 
 async def admin_command(update, context):
     """Pannello /admin: solo il proprietario, solo in chat privata."""
@@ -1142,7 +1164,9 @@ async def admin_command(update, context):
         return
     if user.id != OWNER_ID:
         return  # silenzio: per gli altri il comando non esiste
-    text, markup = build_list_panel(load_local_data())
+    data = load_local_data()
+    await refresh_titles(context, data)
+    text, markup = build_list_panel(data)
     await update.message.reply_text(text, reply_markup=markup, parse_mode='HTML')
 
 async def safe_edit(query, text, markup=None):
@@ -1179,6 +1203,7 @@ async def handle_callback(update, context):
     data = load_local_data()
 
     if action == "l":
+        await refresh_titles(context, data)
         text, markup = build_list_panel(data)
         await safe_edit(query, text, markup)
         return
@@ -1228,12 +1253,20 @@ async def handle_callback(update, context):
         await safe_edit(query, f"⛔ Accesso negato a «{title}»: {note}.", markup)
         spawn(backup_to_telegram(context))
 
-    elif action == "x":  # conferma uscita
+    elif action == "s":  # sospendi: resta nel gruppo ma torna "in attesa"
+        info["approved"] = False
+        info["denied"] = False
+        save_local_data(data)
+        text, markup = build_group_panel(data, chat_id)
+        await safe_edit(query, f"⏸ «{title}» sospeso: il bot resta nel gruppo ma è inattivo.\n\n" + text, markup)
+        spawn(backup_to_telegram(context))
+
+    elif action == "x":  # conferma revoca
         markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🚪 Sì, esci", callback_data=f"xy:{chat_id}"),
+            InlineKeyboardButton("⛔ Sì, revoca", callback_data=f"xy:{chat_id}"),
             InlineKeyboardButton("↩️ Annulla", callback_data=f"g:{chat_id}"),
         ]])
-        await safe_edit(query, f"Vuoi davvero far uscire il bot da «{title}»?\nI dati del gruppo restano salvati.", markup)
+        await safe_edit(query, f"Vuoi davvero revocare l'accesso a «{title}»?\nIl bot esce dal gruppo. I dati (classifiche, conteggi) restano salvati.", markup)
 
     elif action == "xy":  # uscita confermata
         info["approved"] = False
@@ -1242,7 +1275,7 @@ async def handle_callback(update, context):
         left = await leave_group(context, chat_id)
         _, markup = build_group_panel(data, chat_id)
         note = "sono uscito dal gruppo" if left else "non sono riuscito a uscire dal gruppo (puoi toglierlo a mano)"
-        await safe_edit(query, f"🚪 «{title}»: {note}.", markup)
+        await safe_edit(query, f"⛔ Accesso revocato a «{title}»: {note}.", markup)
         spawn(backup_to_telegram(context))
 
 # --- REGISTRAZIONE HANDLER E AVVIO ---
