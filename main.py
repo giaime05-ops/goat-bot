@@ -1,18 +1,25 @@
 """
-GOAT Bot - versione universale (multi-chat).
+GOAT Bot - versione universale (multi-chat) con approvazione dei gruppi.
 
-Nessun ID di gruppo è scritto nel codice: il bot funziona in QUALSIASI gruppo/supergruppo in cui
-viene aggiunto e tiene i dati di ogni chat completamente separati (chiave "chats" -> chat_id nel
-file goat_data.json, che è unico e viene salvato/ripristinato dal gruppo di backup su Telegram).
+Due bot nello stesso programma, con ruoli separati (deciso dal token con cui parte ciascuno):
 
-Ruoli (un bot = un ruolo, deciso dal token con cui parte):
-  - TELEGRAM_TOKEN      -> "GoatBot": modalità GOAT in ogni gruppo (parola "goat", conteggio messaggi,
-                           classifiche, riassunti IA, trascrizioni).
-  - TELEGRAM_TOKEN_BIG  -> (facoltativo) "bot Stallone": modalità STALLONE in ogni gruppo in cui viene
-                           aggiunto (parola "stallone", nessun conteggio, solo /stalloneboard,
-                           qualsiasi altro comando ignorato in silenzio).
-  Un gruppo in cui è già presente la sezione stallone nei dati è "dello stallone": il GoatBot lo ignora.
-  Se TELEGRAM_TOKEN_BIG manca, il GoatBot gestisce da solo entrambe le modalità (in base a questa regola).
+  - TELEGRAM_TOKEN      -> "GoatBot": modalità GOAT in OGNI gruppo approvato dal proprietario
+                           (parola "goat", conteggio messaggi, classifiche, riassunti IA, trascrizioni).
+                           Ha anche il pannello /admin (solo in chat privata col proprietario).
+  - TELEGRAM_TOKEN_BIG  -> "bot Stallone" (facoltativo): lavora SOLO nei gruppi elencati in
+                           STALLONE_CHAT_IDS (default: il gruppo grande). Parola "stallone",
+                           nessun conteggio, solo /stalloneboard, qualsiasi altro comando ignorato.
+                           Niente riassunti, niente goat, niente approvazioni: è un bot a parte.
+
+I gruppi elencati in STALLONE_CHAT_IDS sono ignorati dal GoatBot. Se TELEGRAM_TOKEN_BIG manca, il
+GoatBot gestisce da solo sia i gruppi GOAT sia quelli dello stallone.
+
+Approvazione: quando il GoatBot viene aggiunto a un NUOVO gruppo, resta inattivo e avvisa il proprietario
+(OWNER_ID) nella chat privata con i bottoni Consenti/Nega. I gruppi già presenti nei dati prima
+dell'introduzione dell'approvazione restano attivi.
+
+Tutti i dati (uno spazio separato per ogni chat) stanno in un unico goat_data.json, salvato/ripristinato
+dal gruppo di backup su Telegram.
 """
 import os
 import json
@@ -24,10 +31,14 @@ import logging
 from collections import deque
 from datetime import datetime
 from functools import wraps
+from html import escape
 from zoneinfo import ZoneInfo
 from threading import Thread
 from flask import Flask
-from telegram.ext import Application, MessageHandler, CommandHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, MessageHandler, CommandHandler, CallbackQueryHandler, ChatMemberHandler, filters
+)
 import google.generativeai as genai
 
 # --- LOGGING ---
@@ -38,19 +49,50 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # --- VARIABILI D'AMBIENTE ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # GoatBot: modalità GOAT
-# Token del SECONDO bot (modalità STALLONE). Se manca, il GoatBot gestisce da solo entrambe le modalità.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # GoatBot
+# Token del SECONDO bot (bot Stallone). Se manca, il GoatBot gestisce da solo anche i gruppi dello stallone.
 TELEGRAM_TOKEN_BIG = os.environ.get("TELEGRAM_TOKEN_BIG")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID")  # Es. "-100xxxxxxxxxx"
 
-# --- RUOLI E MODALITÀ ---
+def _parse_owner_id(raw):
+    raw = (raw or "").strip()
+    return int(raw) if raw.lstrip("-").isdigit() else None
+
+# ID Telegram numerico del proprietario (l'unico che può approvare i gruppi e usare /admin).
+# Per scoprirlo: scrivi /myid al bot in chat privata.
+OWNER_ID = _parse_owner_id(os.environ.get("OWNER_ID"))
+
+# Gruppi in cui lavora SOLO il bot Stallone (separati da virgola). Default: il gruppo grande.
+DEFAULT_STALLONE_CHAT_ID = "-1001520340812"
+STALLONE_CHAT_IDS = {
+    x.strip() for x in (os.environ.get("STALLONE_CHAT_IDS") or DEFAULT_STALLONE_CHAT_ID).split(",") if x.strip()
+}
+
+# Tipi di aggiornamento richiesti a Telegram (my_chat_member = il bot viene aggiunto/tolto da un gruppo)
+ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member"]
+
+# --- RUOLI, MODALITÀ, STATI ---
 ROLE_AUTO = "auto"          # bot singolo: modalità scelta in base alla chat
 ROLE_GOAT = "goat"          # GoatBot (con due bot)
 ROLE_STALLONE = "stallone"  # bot Stallone (con due bot)
 MODE_GOAT = "goat"
 MODE_STALLONE = "stallone"
 GROUP_TYPES = ("group", "supergroup")  # il bot lavora solo nei gruppi (non in privato)
+
+STATUS_APPROVED = "approved"
+STATUS_PENDING = "pending"
+STATUS_DENIED = "denied"
+STATUS_ICONS = {STATUS_APPROVED: "✅", STATUS_PENDING: "⏳", STATUS_DENIED: "⛔"}
+STATUS_LABELS = {STATUS_APPROVED: "✅ attivo", STATUS_PENDING: "⏳ in attesa di approvazione", STATUS_DENIED: "⛔ negato"}
+
+# Funzioni attivabili/disattivabili per ogni gruppo dal pannello /admin (tutte attive di default).
+FEATURES = {
+    "goat": ("🐐 GOAT del giorno", "parola «goat», /goatboard, /resetgoat"),
+    "conteggio": ("📊 Conteggio messaggi", "/classificasettimana, /classificaever, /resetmsg"),
+    "riassunto": ("📝 Riassunti IA", "/riassunto, /riassuntolungo"),
+    "trans": ("🎙️ Trascrizione vocali", "/trans"),
+}
 
 # Dopo che il titolo STALLONE è stato assegnato, il messaggio "Già X è il Re Stallone" viene inviato
 # al massimo UNA volta ogni tot secondi, così una raffica di "stallone" (es. a mezzanotte)
@@ -61,6 +103,9 @@ last_already_reply = {}      # chat_id -> istante dell'ultimo "Già X" inviato
 # Protezione dai costi IA: un solo comando IA (riassunti/trascrizioni) ogni tot secondi per chat.
 AI_COOLDOWN = 30  # secondi
 last_ai_request = {}  # chat_id -> istante dell'ultimo comando IA
+
+# Le modifiche dal pannello /admin fanno partire un backup solo dopo questa pausa senza altre modifiche.
+BACKUP_DEBOUNCE = 60  # secondi
 
 # Inizializzazione globale di Gemini con la chiave d'ambiente
 if GEMINI_API_KEY:
@@ -215,6 +260,20 @@ async def backup_to_telegram(context):
         except Exception as e:
             logging.error(f"Errore durante il backup su Telegram: {e}")
 
+_backup_timer = None
+
+def request_backup_soon(context):
+    """Backup ritardato: più modifiche ravvicinate dal pannello /admin generano un solo backup."""
+    global _backup_timer
+    if _backup_timer is not None and not _backup_timer.done():
+        _backup_timer.cancel()
+
+    async def _later():
+        await asyncio.sleep(BACKUP_DEBOUNCE)
+        await backup_to_telegram(context)
+
+    _backup_timer = spawn(_later())
+
 async def restore_from_telegram(app: Application):
     """Scarica all'avvio l'ultimo backup fissato nel gruppo di backup (solo se è un JSON valido)"""
     if not BACKUP_CHAT_ID:
@@ -276,19 +335,38 @@ def ensure_stallone_section(data, chat_id):
     chat_info.setdefault("stallone_leaderboard", {})
     return chat_info
 
-def is_stallone_chat(data, chat_id):
-    """Una chat è "dello stallone" se nei dati ha la sezione stallone."""
-    chat_info = data.get("chats", {}).get(chat_id)
-    return isinstance(chat_info, dict) and "stallone_leaderboard" in chat_info
+def feature_enabled(chat_info, key):
+    """Una funzione è attiva se non è stata disattivata dal pannello /admin."""
+    features = chat_info.get("features") if isinstance(chat_info, dict) else None
+    if not isinstance(features, dict):
+        return True
+    return bool(features.get(key, True))
 
-def resolve_mode(role, data, chat_id):
+# --- APPROVAZIONE DEI GRUPPI ---
+def chat_status(data, chat_id):
+    """
+    Stato di un gruppo per il GoatBot:
+      - nessuna voce nei dati  -> in attesa (gruppo nuovo, serve l'approvazione del proprietario)
+      - voce SENZA campo "approved" -> attivo (gruppo già presente prima dell'introduzione dell'approvazione)
+      - "approved" True/False  -> attivo / in attesa (o negato se "denied")
+    """
+    info = data.get("chats", {}).get(chat_id)
+    if not isinstance(info, dict):
+        return STATUS_PENDING
+    flag = info.get("approved")
+    if flag is None or flag:
+        return STATUS_APPROVED
+    return STATUS_DENIED if info.get("denied") else STATUS_PENDING
+
+# --- RUOLI E MODALITÀ ---
+def resolve_mode(role, chat_id):
     """Modalità con cui QUESTO bot tratta la chat: MODE_GOAT, MODE_STALLONE o None (ignorare)."""
-    claimed = is_stallone_chat(data, chat_id)
+    is_stallone_chat = chat_id in STALLONE_CHAT_IDS
     if role == ROLE_STALLONE:
-        return MODE_STALLONE
-    if role == ROLE_GOAT:
-        return None if claimed else MODE_GOAT
-    return MODE_STALLONE if claimed else MODE_GOAT  # ROLE_AUTO
+        return MODE_STALLONE if is_stallone_chat else None   # il bot Stallone lavora SOLO nei suoi gruppi
+    if is_stallone_chat:
+        return MODE_STALLONE if role == ROLE_AUTO else None  # il GoatBot (con due bot) li ignora
+    return MODE_GOAT
 
 def get_role(context):
     bot_data = getattr(context, "bot_data", None) or {}
@@ -320,6 +398,13 @@ def handle_chat_migration(old_id, new_id):
             f"Aggiorna la variabile BACKUP_CHAT_ID."
         )
         return
+    if old_id in STALLONE_CHAT_IDS:
+        STALLONE_CHAT_IDS.discard(old_id)
+        STALLONE_CHAT_IDS.add(new_id)
+        logging.warning(
+            f"Il gruppo dello stallone è diventato un supergruppo: nuovo ID {new_id}. "
+            f"Aggiorna STALLONE_CHAT_IDS (ora il bot usa già il nuovo ID fino al riavvio)."
+        )
     data = load_local_data()
     if migrate_chat_data(data, old_id, new_id):
         save_local_data(data)
@@ -363,11 +448,11 @@ def admin_only(func):
     return wrapper
 
 # --- FILTRI PER I COMANDI ---
-def _command_for_mode(required_mode):
+def goat_command(feature=None):
     """
-    Il comando funziona solo in un gruppo trattato da QUESTO bot nella modalità richiesta.
-    In ogni altro caso (chat privata, gruppo di backup, modalità diversa) viene IGNORATO in
-    silenzio assoluto: nessuna risposta, nessun messaggio di errore.
+    Il comando funziona solo in un gruppo APPROVATO, trattato dal GoatBot in modalità GOAT, e (se indicata)
+    con la funzione attiva nel pannello /admin. In ogni altro caso (chat privata, gruppo di backup,
+    gruppo in attesa o negato, gruppo dello stallone, funzione spenta) viene IGNORATO in silenzio assoluto.
     """
     def decorator(func):
         @wraps(func)
@@ -375,15 +460,112 @@ def _command_for_mode(required_mode):
             if not update.message or not chat_is_allowed(update):
                 return
             chat_id = str(update.effective_chat.id)
-            mode = resolve_mode(get_role(context), load_local_data(), chat_id)
-            if mode != required_mode:
+            if resolve_mode(get_role(context), chat_id) != MODE_GOAT:
+                return
+            data = load_local_data()
+            if chat_status(data, chat_id) != STATUS_APPROVED:
+                return
+            if feature and not feature_enabled(data.get("chats", {}).get(chat_id), feature):
                 return
             return await func(update, context)
         return wrapper
     return decorator
 
-goat_command = _command_for_mode(MODE_GOAT)
-stallone_command = _command_for_mode(MODE_STALLONE)
+def stallone_command(func):
+    """
+    Il comando funziona solo in un gruppo dello stallone trattato da QUESTO bot. In ogni altro caso
+    viene IGNORATO in silenzio assoluto (nessuna risposta, nessun messaggio di errore).
+    """
+    @wraps(func)
+    async def wrapper(update, context):
+        if not update.message or not chat_is_allowed(update):
+            return
+        if resolve_mode(get_role(context), str(update.effective_chat.id)) != MODE_STALLONE:
+            return
+        return await func(update, context)
+    return wrapper
+
+# --- RICHIESTA DI ACCESSO (NUOVI GRUPPI) ---
+def describe_user(user):
+    if user is None:
+        return None
+    name = escape(getattr(user, "first_name", None) or "?")
+    username = getattr(user, "username", None)
+    return f"{name} (@{escape(username)})" if username else name
+
+async def notify_owner_request(bot, chat_id, title, adder):
+    """Avvisa il proprietario in chat privata, con i bottoni Consenti / Nega."""
+    if OWNER_ID is None:
+        logging.warning(
+            f"Richiesta di accesso del gruppo «{title}» ({chat_id}) ma OWNER_ID non è impostato: "
+            f"il bot resta inattivo lì. Scrivi /myid al bot in privato e imposta OWNER_ID."
+        )
+        return
+    who = describe_user(adder)
+    if who:
+        intro = f"👤 {who} ha aggiunto il bot al gruppo «{escape(title or chat_id)}»"
+    else:
+        intro = f"Il bot è stato aggiunto al gruppo «{escape(title or chat_id)}» (non so da chi)"
+    text = (
+        "🔔 <b>Richiesta di accesso</b>\n\n"
+        f"{intro}\n"
+        f"🆔 <code>{chat_id}</code>\n\n"
+        "Finché non decidi, il bot resta inattivo in quel gruppo."
+    )
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Consenti", callback_data=f"a:{chat_id}"),
+        InlineKeyboardButton("⛔ Nega", callback_data=f"d:{chat_id}"),
+    ]])
+    try:
+        await bot.send_message(chat_id=OWNER_ID, text=text, reply_markup=markup, parse_mode='HTML')
+    except Exception as e:
+        logging.error(
+            f"Impossibile avvisare il proprietario ({e}). Ha premuto /start sul bot in chat privata? "
+            f"Il gruppo «{title}» ({chat_id}) resta in attesa: lo trovi in /admin."
+        )
+
+async def request_access(context, chat, adder):
+    """Registra il gruppo come 'in attesa' e chiede l'approvazione al proprietario."""
+    chat_id = str(chat.id)
+    data = load_local_data()
+    info = ensure_chat(data, chat_id)
+    info["approved"] = False
+    info["denied"] = False
+    title = getattr(chat, "title", None)
+    if title:
+        info["title"] = title
+    if adder is not None:
+        info["added_by"] = {
+            "id": getattr(adder, "id", None),
+            "name": getattr(adder, "first_name", None),
+            "username": getattr(adder, "username", None),
+        }
+    save_local_data(data)
+    await notify_owner_request(context.bot, chat_id, title, adder)
+
+async def handle_my_chat_member(update, context):
+    """Il bot è stato aggiunto a (o tolto da) un gruppo."""
+    change = getattr(update, "my_chat_member", None)
+    if change is None:
+        return
+    chat = change.chat
+    if chat.type not in GROUP_TYPES:
+        return
+    chat_id = str(chat.id)
+    # Il bot Stallone non ha approvazioni; i gruppi dello stallone e di backup non passano da qui
+    if get_role(context) == ROLE_STALLONE or chat_id in STALLONE_CHAT_IDS or is_backup_chat(chat_id):
+        return
+
+    in_states = ("member", "administrator")
+    was_in = change.old_chat_member.status in in_states
+    is_in = change.new_chat_member.status in in_states
+
+    if is_in and not was_in:
+        if chat_status(load_local_data(), chat_id) == STATUS_APPROVED:
+            return  # gruppo già approvato (o già presente): riparte senza chiedere
+        await request_access(context, chat, change.from_user)
+    elif was_in and not is_in:
+        logging.info(f"Il bot non è più nel gruppo «{getattr(chat, 'title', None)}» ({chat_id}).")
 
 # --- GESTIONE MESSAGGI (SMISTAMENTO PER CHAT) ---
 seen_chats = set()
@@ -415,41 +597,61 @@ async def handle_message(update, context):
         return
 
     chat_id = str(update.effective_chat.id)
-    data = load_local_data()
-    mode = resolve_mode(get_role(context), data, chat_id)
+    mode = resolve_mode(get_role(context), chat_id)
     if mode is None:
         return
 
-    log_chat_once(update, mode)
+    data = load_local_data()
+
     if mode == MODE_GOAT:
+        if chat_status(data, chat_id) != STATUS_APPROVED:
+            # Gruppo non approvato: silenzio. Se non ho mai visto l'ingresso del bot (ad esempio il bot
+            # era spento quando è stato aggiunto), registro ora la richiesta e avviso il proprietario.
+            if chat_id not in data.get("chats", {}):
+                await request_access(context, update.effective_chat, None)
+            return
+        log_chat_once(update, mode)
         await handle_goat_message(update, context, data)
     else:
+        log_chat_once(update, mode)
         await handle_stallone_message(update, context, data)
 
 # --- MODALITÀ GOAT: GOAT DEL GIORNO + CONTEGGIO MESSAGGI (dati della SOLA chat corrente) ---
 async def handle_goat_message(update, context, data):
     user = update.message.from_user
-    chat_id = str(update.effective_chat.id)
+    chat = update.effective_chat
+    chat_id = str(chat.id)
 
     text_content = (update.message.text or update.message.caption or "").strip()
     display_name = user.first_name
 
-    # 1. Salva messaggio per il riassunto di QUESTA chat (solo se contiene testo/didascalia)
-    if text_content:
+    chat_info = ensure_goat_section(data, chat_id)
+    dirty = False
+
+    # Tiene aggiornato il titolo del gruppo (serve al pannello /admin)
+    title = getattr(chat, "title", None)
+    if title and chat_info.get("title") != title:
+        chat_info["title"] = title
+        dirty = True
+
+    # 1. Salva messaggio per il riassunto di QUESTA chat (solo se contiene testo e i riassunti sono attivi)
+    if text_content and feature_enabled(chat_info, "riassunto"):
         history = chat_history.get(chat_id)
         if history is None:
             history = chat_history[chat_id] = deque(maxlen=HISTORY_MAX)
         history.append(f"{display_name}: {text_content}")
 
     # 2. Registra conteggio per QUALSIASI messaggio (Testo, Foto, GIF, Sticker, Vocali, ecc.)
-    chat_info = ensure_goat_section(data, chat_id)
-    chat_info["msg_weekly"][display_name] = chat_info["msg_weekly"].get(display_name, 0) + 1
-    chat_info["msg_ever"][display_name] = chat_info["msg_ever"].get(display_name, 0) + 1
+    if feature_enabled(chat_info, "conteggio"):
+        chat_info["msg_weekly"][display_name] = chat_info["msg_weekly"].get(display_name, 0) + 1
+        chat_info["msg_ever"][display_name] = chat_info["msg_ever"].get(display_name, 0) + 1
+        dirty = True
 
-    save_local_data(data)
+    if dirty:
+        save_local_data(data)
 
     # 3. Logica GOAT (solo se il contenuto testuale è la parola "goat")
-    if text_content.lower() == "goat":
+    if feature_enabled(chat_info, "goat") and text_content.lower() == "goat":
         # Il giorno conta dall'orario in cui il messaggio è stato scritto (non da quando il bot lo elabora)
         today = get_message_date(update)
         last_date = chat_info["last_date"]
@@ -482,12 +684,6 @@ async def handle_stallone_message(update, context, data):
     user = update.message.from_user
     chat_id = str(update.effective_chat.id)
 
-    # Il primo messaggio visto in una chat "prenota" la chat per lo stallone (il GoatBot la ignorerà)
-    was_claimed = is_stallone_chat(data, chat_id)
-    chat_info = ensure_stallone_section(data, chat_id)
-    if not was_claimed:
-        save_local_data(data)
-
     # Solo il TESTO del messaggio (niente didascalie di foto/video) e solo se è
     # esattamente la parola "stallone" (maiuscole/minuscole e spazi ai bordi ininfluenti).
     # Qualsiasi altra cosa -> il bot non risponde affatto.
@@ -497,6 +693,7 @@ async def handle_stallone_message(update, context, data):
     if text_content.lower() != "stallone":
         return
 
+    chat_info = ensure_stallone_section(data, chat_id)
     display_name = user.first_name
     # Il giorno conta dall'orario in cui il messaggio è stato scritto (non da quando il bot lo elabora)
     today = get_message_date(update)
@@ -537,11 +734,7 @@ async def handle_stallone_message(update, context, data):
 @stallone_command
 async def show_stalloneboard(update, context):
     chat_id = str(update.effective_chat.id)
-    data = load_local_data()
-    was_claimed = is_stallone_chat(data, chat_id)
-    chat_info = ensure_stallone_section(data, chat_id)
-    if not was_claimed:
-        save_local_data(data)
+    chat_info = ensure_stallone_section(load_local_data(), chat_id)
 
     leaderboard = chat_info["stallone_leaderboard"]
     if not leaderboard:
@@ -559,8 +752,8 @@ async def show_stalloneboard(update, context):
 
     await update.message.reply_text(text, parse_mode='HTML')
 
-# --- COMANDI RESET (SOLO ADMIN, SOLO DATI DELLA CHAT CORRENTE) ---
-@goat_command
+# --- COMANDI RESET (SOLO ADMIN DEL GRUPPO, SOLO DATI DELLA CHAT CORRENTE) ---
+@goat_command("goat")
 @admin_only
 async def reset_goatboard(update, context):
     chat_id = str(update.effective_chat.id)
@@ -575,7 +768,7 @@ async def reset_goatboard(update, context):
     await update.message.reply_text("🧹 Classifica GOAT azzerata con successo!", parse_mode='HTML')
     spawn(backup_to_telegram(context))
 
-@goat_command
+@goat_command("conteggio")
 @admin_only
 async def reset_msgboard(update, context):
     chat_id = str(update.effective_chat.id)
@@ -589,23 +782,36 @@ async def reset_msgboard(update, context):
     await update.message.reply_text("🧹 Classifiche dei messaggi (settimanale ed ever) azzerate!", parse_mode='HTML')
     spawn(backup_to_telegram(context))
 
-# --- COMANDO LISTA COMANDI ---
-@goat_command
+# --- COMANDO LISTA COMANDI (mostra solo le funzioni attive nel gruppo) ---
+@goat_command()
 async def show_commands(update, context):
-    text = (
-        "🤖 <b>LISTA COMANDI DI GOAT BOT</b> 🐐\n\n"
-        "👑 <b>/goatboard</b> - Mostra la classifica storica delle vittorie GOAT giornaliere.\n"
-        "📊 <b>/classificasettimana</b> - Mostra la classifica dei messaggi scritti questa settimana.\n"
-        "👑 <b>/classificaever</b> - Mostra la classifica generale dei messaggi di sempre.\n"
-        "📝 <b>/riassunto</b> - Genera un riassunto breve degli ultimi messaggi tramite IA.\n"
-        "📜 <b>/riassuntolungo</b> - Genera un riassunto esteso e dettagliato tramite IA.\n"
-        "🎙️ <b>/trans</b> - Rispondi a un messaggio vocale per ottenerne la trascrizione testuale.\n"
-        "ℹ️ <b>/goatcomm</b> - Mostra questo pannello con tutti i comandi.\n\n"
-        "🧹 <b>/resetgoat</b> - Azzera la classifica GOAT del gruppo (solo admin).\n"
-        "🧹 <b>/resetmsg</b> - Azzera le classifiche dei messaggi (solo admin).\n\n"
-        "💡 <i>Curiosità: Scrivi semplicemente <b>goat</b> in chat per eleggere il GOAT del giorno!</i>"
-    )
-    await update.message.reply_text(text, parse_mode='HTML')
+    chat_id = str(update.effective_chat.id)
+    info = ensure_goat_section(load_local_data(), chat_id)
+
+    def on(key):
+        return feature_enabled(info, key)
+
+    lines = ["🤖 <b>LISTA COMANDI DI GOAT BOT</b> 🐐\n"]
+    if on("goat"):
+        lines.append("👑 <b>/goatboard</b> - Mostra la classifica storica delle vittorie GOAT giornaliere.")
+    if on("conteggio"):
+        lines.append("📊 <b>/classificasettimana</b> - Mostra la classifica dei messaggi scritti questa settimana.")
+        lines.append("👑 <b>/classificaever</b> - Mostra la classifica generale dei messaggi di sempre.")
+    if on("riassunto"):
+        lines.append("📝 <b>/riassunto</b> - Genera un riassunto breve degli ultimi messaggi tramite IA.")
+        lines.append("📜 <b>/riassuntolungo</b> - Genera un riassunto esteso e dettagliato tramite IA.")
+    if on("trans"):
+        lines.append("🎙️ <b>/trans</b> - Rispondi a un messaggio vocale per ottenerne la trascrizione testuale.")
+    lines.append("ℹ️ <b>/goatcomm</b> - Mostra questo pannello con tutti i comandi.")
+    if on("goat") or on("conteggio"):
+        lines.append("")
+        if on("goat"):
+            lines.append("🧹 <b>/resetgoat</b> - Azzera la classifica GOAT del gruppo (solo admin).")
+        if on("conteggio"):
+            lines.append("🧹 <b>/resetmsg</b> - Azzera le classifiche dei messaggi (solo admin).")
+    if on("goat"):
+        lines.append("\n💡 <i>Curiosità: Scrivi semplicemente <b>goat</b> in chat per eleggere il GOAT del giorno!</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
 # --- CLASSIFICHE MESSAGGI ---
 def generate_ranking_text(title, ranking_dict):
@@ -623,7 +829,7 @@ def generate_ranking_text(title, ranking_dict):
 
     return text
 
-@goat_command
+@goat_command("conteggio")
 async def show_weekly_ranking(update, context):
     chat_id = str(update.effective_chat.id)
     chat_info = ensure_goat_section(load_local_data(), chat_id)
@@ -631,7 +837,7 @@ async def show_weekly_ranking(update, context):
     text = generate_ranking_text("📊 <b>CLASSIFICA SETTIMANALE MESSAGGI</b> 📊", chat_info["msg_weekly"])
     await update.message.reply_text(text, parse_mode='HTML')
 
-@goat_command
+@goat_command("conteggio")
 async def show_ever_ranking(update, context):
     chat_id = str(update.effective_chat.id)
     chat_info = ensure_goat_section(load_local_data(), chat_id)
@@ -639,7 +845,7 @@ async def show_ever_ranking(update, context):
     text = generate_ranking_text("👑 <b>CLASSIFICA GENERALE MESSAGGI (EVER)</b> 👑", chat_info["msg_ever"])
     await update.message.reply_text(text, parse_mode='HTML')
 
-@goat_command
+@goat_command("goat")
 async def show_goatboard(update, context):
     chat_id = str(update.effective_chat.id)
     chat_info = ensure_goat_section(load_local_data(), chat_id)
@@ -666,8 +872,10 @@ async def run_weekly_reset(app):
     sent_ok, migrations = [], []
 
     for chat_id, chat_info in list(snapshot.get("chats", {}).items()):
-        # Solo chat in modalità GOAT con messaggi della settimana; mai chat dello stallone o di backup
-        if not isinstance(chat_info, dict) or is_stallone_chat(snapshot, chat_id) or is_backup_chat(chat_id):
+        # Solo gruppi GOAT approvati con il conteggio attivo; mai gruppi dello stallone o di backup
+        if not isinstance(chat_info, dict) or chat_id in STALLONE_CHAT_IDS or is_backup_chat(chat_id):
+            continue
+        if chat_status(snapshot, chat_id) != STATUS_APPROVED or not feature_enabled(chat_info, "conteggio"):
             continue
         weekly = chat_info.get("msg_weekly") or {}
         if not weekly:
@@ -737,11 +945,11 @@ async def check_ai_cooldown(update):
     last_ai_request[chat_id] = time.monotonic()
     return True
 
-@goat_command
+@goat_command("riassunto")
 async def make_summary(update, context):
     await start_summary(update, limit=75, title="RIASSUNTO BREVE")
 
-@goat_command
+@goat_command("riassunto")
 async def make_long_summary(update, context):
     await start_summary(update, limit=500, title="RIASSUNTO ESTESO")
 
@@ -784,10 +992,11 @@ async def generate_summary_response(update, limit, title):
         await status_msg.edit_text(summary_text, parse_mode='HTML')
 
     except Exception as e:
+        logging.error(f"Errore riassunto (chat {chat_id}): {e}")
         await status_msg.edit_text(f"❌ Errore riscontrato: {str(e)}")
 
 # --- COMANDO TRASCRIZIONE AUDIO ---
-@goat_command
+@goat_command("trans")
 async def transcribe_audio(update, context):
     reply_msg = update.message.reply_to_message
     if not reply_msg or not (reply_msg.voice or reply_msg.audio or reply_msg.video_note):
@@ -843,6 +1052,199 @@ async def run_transcription(update, context, reply_msg):
         if os.path.exists(file_path):
             os.remove(file_path)
 
+# --- CHAT PRIVATA COL PROPRIETARIO: /myid, /start, /admin ---
+def _private_user(update):
+    """Utente che scrive in chat privata (None se il messaggio non è in privato)."""
+    chat = update.effective_chat
+    msg = update.message
+    if chat is None or msg is None or chat.type != "private" or msg.from_user is None:
+        return None
+    return msg.from_user
+
+async def myid_command(update, context):
+    """Mostra a chiunque il proprio ID Telegram (serve per impostare OWNER_ID)."""
+    user = _private_user(update)
+    if user is None:
+        return
+    await update.message.reply_text(f"🆔 Il tuo ID Telegram è <code>{user.id}</code>", parse_mode='HTML')
+
+async def start_command(update, context):
+    user = _private_user(update)
+    if user is None or OWNER_ID is None or user.id != OWNER_ID:
+        return
+    await update.message.reply_text("👋 Ciao! Usa /admin per gestire i gruppi in cui è il bot.")
+
+def managed_chats(data):
+    """Gruppi gestiti dal GoatBot (esclusi quelli dello stallone e il gruppo di backup), per titolo."""
+    result = []
+    for chat_id, info in data.get("chats", {}).items():
+        if not isinstance(info, dict) or chat_id in STALLONE_CHAT_IDS or is_backup_chat(chat_id):
+            continue
+        result.append((chat_id, info))
+    result.sort(key=lambda item: (item[1].get("title") or item[0]).lower())
+    return result
+
+def build_list_panel(data):
+    rows = []
+    for chat_id, info in managed_chats(data):
+        icon = STATUS_ICONS[chat_status(data, chat_id)]
+        label = f"{icon} {info.get('title') or chat_id}"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"g:{chat_id}")])
+    text = (
+        "🛠 <b>Pannello admin</b>\n\n"
+        "Scegli un gruppo da gestire.\n"
+        "✅ attivo · ⏳ in attesa · ⛔ negato"
+    )
+    if not rows:
+        text += "\n\n<i>Il bot non è ancora in nessun gruppo.</i>"
+    return text, InlineKeyboardMarkup(rows)
+
+def build_group_panel(data, chat_id):
+    info = data.get("chats", {}).get(chat_id)
+    back = [InlineKeyboardButton("⬅️ Indietro", callback_data="l")]
+    if not isinstance(info, dict):
+        return "Gruppo non trovato.", InlineKeyboardMarkup([back])
+
+    status = chat_status(data, chat_id)
+    title = escape(info.get("title") or chat_id)
+    text = f"⚙️ <b>{title}</b>\n🆔 <code>{chat_id}</code>\nStato: {STATUS_LABELS[status]}\n"
+    rows = []
+
+    if status == STATUS_APPROVED:
+        text += "\nAttiva o disattiva le funzioni di questo gruppo (quelle spente restano in silenzio):\n"
+        for key, (label, commands) in FEATURES.items():
+            enabled = feature_enabled(info, key)
+            text += f"\n• {label} — <i>{escape(commands)}</i>"
+            rows.append([InlineKeyboardButton(f"{'✅' if enabled else '❌'} {label}", callback_data=f"t:{chat_id}:{key}")])
+        rows.append([InlineKeyboardButton("🚪 Esci dal gruppo", callback_data=f"x:{chat_id}")])
+    elif status == STATUS_PENDING:
+        text += "\nIl bot è inattivo in questo gruppo finché non decidi."
+        rows.append([
+            InlineKeyboardButton("✅ Consenti", callback_data=f"a:{chat_id}"),
+            InlineKeyboardButton("⛔ Nega", callback_data=f"d:{chat_id}"),
+        ])
+    else:
+        text += "\nIl bot è uscito da questo gruppo. Per riattivarlo, aggiungilo di nuovo: ti arriverà una nuova richiesta."
+    rows.append(back)
+    return text, InlineKeyboardMarkup(rows)
+
+async def admin_command(update, context):
+    """Pannello /admin: solo il proprietario, solo in chat privata."""
+    user = _private_user(update)
+    if user is None:
+        return
+    if OWNER_ID is None:
+        await update.message.reply_text(
+            f"⚠️ La variabile OWNER_ID non è impostata. Il tuo ID Telegram è <code>{user.id}</code>: "
+            "impostalo come OWNER_ID e riavvia il bot.",
+            parse_mode='HTML'
+        )
+        return
+    if user.id != OWNER_ID:
+        return  # silenzio: per gli altri il comando non esiste
+    text, markup = build_list_panel(load_local_data())
+    await update.message.reply_text(text, reply_markup=markup, parse_mode='HTML')
+
+async def safe_edit(query, text, markup=None):
+    try:
+        await query.edit_message_text(text, reply_markup=markup, parse_mode='HTML')
+    except Exception as e:  # ad esempio "message is not modified"
+        logging.info(f"Modifica del messaggio ignorata: {e}")
+
+async def leave_group(context, chat_id):
+    try:
+        await context.bot.leave_chat(chat_id=int(chat_id))
+        return True
+    except Exception as e:
+        logging.error(f"Impossibile uscire dal gruppo {chat_id}: {e}")
+        return False
+
+async def handle_callback(update, context):
+    """Bottoni inline (approvazioni e pannello /admin): li accetta SOLO dal proprietario."""
+    query = getattr(update, "callback_query", None)
+    if query is None:
+        return
+    user = query.from_user
+    if OWNER_ID is None or user is None or user.id != OWNER_ID:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+    await query.answer()
+
+    parts = (query.data or "").split(":")
+    action = parts[0]
+    chat_id = parts[1] if len(parts) > 1 else None
+    data = load_local_data()
+
+    if action == "l":
+        text, markup = build_list_panel(data)
+        await safe_edit(query, text, markup)
+        return
+
+    # Tutte le altre azioni riguardano un gruppo gestito dal GoatBot
+    if chat_id not in dict(managed_chats(data)):
+        text, markup = build_list_panel(data)
+        await safe_edit(query, "Gruppo non trovato.\n\n" + text, markup)
+        return
+    info = data["chats"][chat_id]
+    title = escape(info.get("title") or chat_id)
+
+    if action == "g":
+        text, markup = build_group_panel(data, chat_id)
+        await safe_edit(query, text, markup)
+
+    elif action == "t" and len(parts) == 3 and parts[2] in FEATURES:
+        features = info.setdefault("features", {})
+        features[parts[2]] = not feature_enabled(info, parts[2])
+        save_local_data(data)
+        request_backup_soon(context)
+        text, markup = build_group_panel(data, chat_id)
+        await safe_edit(query, text, markup)
+
+    elif action == "a":  # consenti
+        info["approved"] = True
+        info["denied"] = False
+        save_local_data(data)
+        try:
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text="✅ GOAT Bot attivato in questo gruppo! Scrivi /goatcomm per vedere i comandi."
+            )
+        except Exception as e:
+            logging.error(f"Impossibile scrivere nel gruppo {chat_id} dopo l'approvazione: {e}")
+        text, markup = build_group_panel(data, chat_id)
+        await safe_edit(query, f"✅ Accesso consentito a «{title}».\n\n" + text, markup)
+        spawn(backup_to_telegram(context))
+
+    elif action == "d":  # nega (e esci)
+        info["approved"] = False
+        info["denied"] = True
+        save_local_data(data)
+        left = await leave_group(context, chat_id)
+        _, markup = build_group_panel(data, chat_id)
+        note = "sono uscito dal gruppo" if left else "non sono riuscito a uscire dal gruppo (puoi toglierlo a mano)"
+        await safe_edit(query, f"⛔ Accesso negato a «{title}»: {note}.", markup)
+        spawn(backup_to_telegram(context))
+
+    elif action == "x":  # conferma uscita
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🚪 Sì, esci", callback_data=f"xy:{chat_id}"),
+            InlineKeyboardButton("↩️ Annulla", callback_data=f"g:{chat_id}"),
+        ]])
+        await safe_edit(query, f"Vuoi davvero far uscire il bot da «{title}»?\nI dati del gruppo restano salvati.", markup)
+
+    elif action == "xy":  # uscita confermata
+        info["approved"] = False
+        info["denied"] = True
+        save_local_data(data)
+        left = await leave_group(context, chat_id)
+        _, markup = build_group_panel(data, chat_id)
+        note = "sono uscito dal gruppo" if left else "non sono riuscito a uscire dal gruppo (puoi toglierlo a mano)"
+        await safe_edit(query, f"🚪 «{title}»: {note}.", markup)
+        spawn(backup_to_telegram(context))
+
 # --- REGISTRAZIONE HANDLER E AVVIO ---
 def register_handlers(application, role):
     """Registra i gestori del bot in base al suo ruolo (goat / stallone / auto)."""
@@ -860,6 +1262,12 @@ def register_handlers(application, role):
         application.add_handler(CommandHandler("goatcomm", show_commands))
         application.add_handler(CommandHandler("resetgoat", reset_goatboard))
         application.add_handler(CommandHandler("resetmsg", reset_msgboard))
+        # Chat privata col proprietario + approvazione dei nuovi gruppi
+        application.add_handler(CommandHandler("admin", admin_command))
+        application.add_handler(CommandHandler("myid", myid_command))
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CallbackQueryHandler(handle_callback))
+        application.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     if role in (ROLE_STALLONE, ROLE_AUTO):
         application.add_handler(CommandHandler("stalloneboard", show_stalloneboard))
 
@@ -905,9 +1313,12 @@ async def run_two_bots():
         for a in apps:
             await a.start()
             started.append(a)
-            await a.updater.start_polling()
+            await a.updater.start_polling(allowed_updates=ALLOWED_UPDATES)
 
-        print("GOAT Bot attivo! (2 bot: GoatBot + bot Stallone, qualsiasi gruppo)", flush=True)
+        print("GOAT Bot attivo! (2 bot: GoatBot + bot Stallone)", flush=True)
+        if OWNER_ID is None:
+            print("ATTENZIONE: OWNER_ID non impostato: i nuovi gruppi non possono essere approvati. "
+                  "Scrivi /myid al GoatBot in privato e imposta OWNER_ID.", flush=True)
         await stop_event.wait()
     finally:
         if weekly_task:
@@ -937,8 +1348,11 @@ def main():
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     register_handlers(application, ROLE_AUTO)
 
-    print("GOAT Bot attivo! (bot singolo, qualsiasi gruppo)", flush=True)
-    application.run_polling()
+    print("GOAT Bot attivo! (bot singolo)", flush=True)
+    if OWNER_ID is None:
+        print("ATTENZIONE: OWNER_ID non impostato: i nuovi gruppi non possono essere approvati. "
+              "Scrivi /myid al bot in privato e imposta OWNER_ID.", flush=True)
+    application.run_polling(allowed_updates=ALLOWED_UPDATES)
 
 if __name__ == '__main__':
     main()
