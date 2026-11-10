@@ -1080,20 +1080,27 @@ def managed_chats(data):
     for chat_id, info in data.get("chats", {}).items():
         if not isinstance(info, dict) or chat_id in STALLONE_CHAT_IDS or is_backup_chat(chat_id):
             continue
+        if info.get("merged_into"):
+            continue  # doppione di un gruppo già migrato: non va mostrato
         result.append((chat_id, info))
     result.sort(key=lambda item: (item[1].get("title") or item[0]).lower())
     return result
 
 def build_list_panel(data):
     rows = []
-    for chat_id, info in managed_chats(data):
+    chats = managed_chats(data)
+    names = [info.get("title") for _, info in chats if info.get("title")]
+    for chat_id, info in chats:
         icon = STATUS_ICONS[chat_status(data, chat_id)]
-        label = f"{icon} {info.get('title') or chat_id}"
+        name = info.get("title") or chat_id
+        if info.get("title") and names.count(info["title"]) > 1:
+            name += f" (…{chat_id[-4:]})"  # due gruppi con lo stesso nome: distinguo con le ultime cifre dell'ID
+        label = f"{icon} {name}" + (" 💤" if info.get("unreachable") else "")
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"g:{chat_id}")])
     text = (
         "🛠 <b>Pannello admin</b>\n\n"
         "Scegli un gruppo da gestire.\n"
-        "✅ attivo · ⏳ in attesa · ⛔ negato"
+        "✅ attivo · ⏳ in attesa · ⛔ negato · 💤 bot non più nel gruppo"
     )
     if not rows:
         text += "\n\n<i>Il bot non è ancora in nessun gruppo.</i>"
@@ -1108,6 +1115,8 @@ def build_group_panel(data, chat_id):
     status = chat_status(data, chat_id)
     title = escape(info.get("title") or chat_id)
     text = f"⚙️ <b>{title}</b>\n🆔 <code>{chat_id}</code>\nStato: {STATUS_LABELS[status]}\n"
+    if info.get("unreachable"):
+        text += "💤 Il bot non risulta più in questo gruppo (o il gruppo non esiste più).\n"
     rows = []
 
     if status == STATUS_APPROVED:
@@ -1134,18 +1143,39 @@ def build_group_panel(data, chat_id):
     return text, InlineKeyboardMarkup(rows)
 
 async def refresh_titles(context, data):
-    """Completa i nomi dei gruppi che ancora non lo hanno (chiedendoli a Telegram). True se qualcosa è cambiato."""
+    """
+    Aggiorna l'elenco dei gruppi interrogando Telegram: nomi mancanti o cambiati, gruppi diventati
+    supergruppi (i dati passano al nuovo ID, niente doppioni) e gruppi dove il bot non c'è più (💤).
+    True se qualcosa è cambiato.
+    """
     changed = False
     for chat_id, info in managed_chats(data):
-        if info.get("title"):
-            continue
         try:
             chat = await context.bot.get_chat(chat_id=int(chat_id))
-            if getattr(chat, "title", None):
-                info["title"] = chat.title
+            title = getattr(chat, "title", None)
+            if title and info.get("title") != title:
+                info["title"] = title
+                changed = True
+            if info.pop("unreachable", None):
                 changed = True
         except Exception as e:
-            logging.info(f"Nome del gruppo {chat_id} non disponibile: {e}")
+            new_id = getattr(e, "new_chat_id", None)
+            if new_id:
+                new_id = str(new_id)
+                if migrate_chat_data(data, chat_id, new_id):
+                    logging.info(f"Gruppo {chat_id} diventato supergruppo {new_id}: dati spostati.")
+                else:
+                    # il nuovo ID ha già i suoi dati: il vecchio è un doppione, lo nascondo dall'elenco
+                    info["merged_into"] = new_id
+                changed = True
+            elif type(e).__name__ in ("Forbidden", "BadRequest"):
+                # il bot non è più nel gruppo (o il gruppo non esiste più)
+                if not info.get("unreachable"):
+                    info["unreachable"] = True
+                    changed = True
+            else:
+                logging.info(f"Gruppo {chat_id}: verifica non riuscita ({e})")
+        await asyncio.sleep(0.05)
     if changed:
         save_local_data(data)
     return changed
